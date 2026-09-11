@@ -1,0 +1,15 @@
+services:
+  chronos:
+    build: .
+    container_name: chronos-engine
+    restart: unless-stopped
+    ports:
+      - "8080:8080/tcp"
+      - "9000-9099:9000-9099/udp"
+    volumes:
+      - /srv/chronos/media:/media:ro
+      - ./config:/app/config:ro
+    environment:
+      MEDIA_ROOT: /media
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: chronos_engine=info,tower_http=info

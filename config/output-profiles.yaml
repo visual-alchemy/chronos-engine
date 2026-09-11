@@ -1,0 +1,18 @@
+profiles:
+  srt-ts-universal:
+    description: H.264/AAC MPEG-TS over SRT for general receivers
+    protocol: srt
+    container: mpegts
+    video_copy_codecs: [h264]
+    audio_copy_codecs: [aac, mp3, mp2, ac3]
+    fallback_video: h264
+    fallback_audio: aac
+    default_latency_ms: 120
+  srt-ts-hevc:
+    description: HEVC/AAC MPEG-TS over SRT for verified HEVC receivers
+    protocol: srt
+    container: mpegts
+    video_copy_codecs: [h265, hevc]
+    audio_copy_codecs: [aac, ac3]
+    fallback_video: h265
+    fallback_audio: aac
