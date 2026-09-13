@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Supervisor {
     inner: Arc<Mutex<HashMap<String, ManagedStream>>>,
+    publication: Arc<Mutex<()>>,
     events: broadcast::Sender<StreamEvent>,
 }
 struct ManagedStream {
@@ -53,6 +54,7 @@ impl Supervisor {
         let (events, _) = broadcast::channel(128);
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            publication: Arc::new(Mutex::new(())),
             events,
         }
     }
@@ -289,6 +291,10 @@ impl Supervisor {
         self.emit(id, StreamState::Failed, Some(detail));
     }
     fn record_client_added(&self, id: &str, client: SrtClientAddress) {
+        let _publication = match self.publication.lock() {
+            Ok(publication) => publication,
+            Err(_) => return,
+        };
         let event = {
             let mut streams = match self.inner.lock() {
                 Ok(streams) => streams,
@@ -306,6 +312,10 @@ impl Supervisor {
         let _ = self.events.send(event);
     }
     fn record_client_removed(&self, id: &str, client: &SrtClientAddress) {
+        let _publication = match self.publication.lock() {
+            Ok(publication) => publication,
+            Err(_) => return,
+        };
         let event = {
             let mut streams = match self.inner.lock() {
                 Ok(streams) => streams,
@@ -324,6 +334,10 @@ impl Supervisor {
         let _ = self.events.send(event);
     }
     fn emit(&self, id: &str, state: StreamState, detail: Option<String>) {
+        let _publication = match self.publication.lock() {
+            Ok(publication) => publication,
+            Err(_) => return,
+        };
         let event = {
             let streams = self.inner.lock().ok();
             streams
@@ -347,6 +361,12 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{TryLockError, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
+
     use gstreamer as gst;
     use tokio::sync::broadcast::error::TryRecvError;
 
@@ -437,5 +457,97 @@ mod tests {
 
         assert!(supervisor.states().is_empty());
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn publishes_concurrent_client_updates_in_mutation_order() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let mut events = supervisor.subscribe();
+        let client = SrtClientAddress {
+            ip: "192.0.2.10".into(),
+            port: 54321,
+        };
+
+        let inner_guard = supervisor.inner.lock().unwrap();
+        let add_supervisor = supervisor.clone();
+        let add_client = client.clone();
+        let (add_started_tx, add_started_rx) = mpsc::channel();
+        let add = thread::spawn(move || {
+            add_started_tx.send(()).unwrap();
+            add_supervisor.record_client_added("feed", add_client);
+        });
+        add_started_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match supervisor.publication.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Err(TryLockError::Poisoned(_)) => panic!("publication mutex poisoned"),
+                Ok(guard) => drop(guard),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "add never acquired publication lock"
+            );
+            thread::yield_now();
+        }
+
+        let remove_supervisor = supervisor.clone();
+        let remove_client = client.clone();
+        let (remove_started_tx, remove_started_rx) = mpsc::channel();
+        let remove = thread::spawn(move || {
+            remove_started_tx.send(()).unwrap();
+            remove_supervisor.record_client_removed("feed", &remove_client);
+        });
+        remove_started_rx.recv().unwrap();
+
+        drop(inner_guard);
+        add.join().unwrap();
+        remove.join().unwrap();
+
+        assert_eq!(events.try_recv().unwrap().clients, vec![client]);
+        let last_event = events.try_recv().unwrap();
+        assert!(last_event.clients.is_empty());
+        assert_eq!(last_event.clients, supervisor.states()[0].clients);
+    }
+
+    #[test]
+    fn emit_preserves_explicit_state_and_snapshots_managed_fields() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let client = SrtClientAddress {
+            ip: "192.0.2.10".into(),
+            port: 54321,
+        };
+        supervisor.record_client_added("feed", client.clone());
+        let mut events = supervisor.subscribe();
+
+        supervisor.emit("feed", StreamState::Starting, Some("starting again".into()));
+
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.state, StreamState::Starting);
+        assert_eq!(event.detail.as_deref(), Some("starting again"));
+        assert_eq!(event.port, Some(9000));
+        assert_eq!(event.latency_ms, Some(120));
+        assert_eq!(event.mode, Some(ProcessingMode::RemuxCopy));
+        assert_eq!(event.loop_count, Some(0));
+        assert_eq!(event.clients, vec![client]);
+    }
+
+    #[test]
+    fn emit_uses_empty_fallback_for_unknown_streams() {
+        let supervisor = Supervisor::new();
+        let mut events = supervisor.subscribe();
+
+        supervisor.emit("missing", StreamState::Stopped, Some("gone".into()));
+
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.stream_id, "missing");
+        assert_eq!(event.state, StreamState::Stopped);
+        assert_eq!(event.detail.as_deref(), Some("gone"));
+        assert_eq!(event.port, None);
+        assert_eq!(event.latency_ms, None);
+        assert_eq!(event.mode, None);
+        assert_eq!(event.loop_count, None);
+        assert!(event.clients.is_empty());
     }
 }
