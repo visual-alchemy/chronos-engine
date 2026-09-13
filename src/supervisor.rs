@@ -10,7 +10,7 @@ use gstreamer::prelude::*;
 use tokio::sync::broadcast;
 
 use crate::{
-    domain::{ProcessingMode, StreamEvent, StreamState},
+    domain::{ProcessingMode, SrtClientAddress, StreamEvent, StreamState},
     gst_runtime::{build_h264_aac_copy_pipeline, build_hybrid_pipeline, build_transcode_pipeline},
     streams::SrtListenerConfig,
 };
@@ -27,6 +27,25 @@ struct ManagedStream {
     restarts: u64,
     config: SrtListenerConfig,
     mode: ProcessingMode,
+    clients: Vec<SrtClientAddress>,
+}
+
+fn event_from_managed(
+    id: &str,
+    managed: &ManagedStream,
+    state: StreamState,
+    detail: Option<String>,
+) -> StreamEvent {
+    StreamEvent {
+        stream_id: id.into(),
+        state,
+        detail,
+        port: Some(managed.config.port),
+        latency_ms: Some(managed.config.latency_ms),
+        mode: Some(managed.mode.clone()),
+        loop_count: Some(managed.restarts),
+        clients: managed.clients.clone(),
+    }
 }
 
 impl Supervisor {
@@ -46,16 +65,7 @@ impl Supervisor {
             .map(|streams| {
                 streams
                     .iter()
-                    .map(|(id, managed)| StreamEvent {
-                        stream_id: id.clone(),
-                        state: managed.state,
-                        detail: None,
-                        port: Some(managed.config.port),
-                        latency_ms: Some(managed.config.latency_ms),
-                        mode: Some(managed.mode.clone()),
-                        loop_count: Some(managed.restarts),
-                        clients: Vec::new(),
-                    })
+                    .map(|(id, managed)| event_from_managed(id, managed, managed.state, None))
                     .collect()
             })
             .unwrap_or_default()
@@ -116,6 +126,7 @@ impl Supervisor {
                     restarts: 0u64,
                     config,
                     mode,
+                    clients: Vec::new(),
                 },
             );
         self.emit(&id, StreamState::WaitingForCaller, None);
@@ -177,13 +188,22 @@ impl Supervisor {
                             .and_then(|s| s.get(id).map(|m| m.pipeline.name().to_string()));
                         let is_pipeline_msg = src_name.is_some() && src_name == pipeline_name;
                         if is_pipeline_msg && sc.current() == gst::State::Playing {
-                            if let Ok(mut streams) = self.inner.lock() {
+                            let state_changed = if let Ok(mut streams) = self.inner.lock() {
                                 if let Some(managed) = streams.get_mut(id) {
                                     if managed.state == StreamState::WaitingForCaller {
                                         managed.state = StreamState::Running;
-                                        self.emit(id, StreamState::Running, None);
+                                        true
+                                    } else {
+                                        false
                                     }
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
+                            };
+                            if state_changed {
+                                self.emit(id, StreamState::Running, None);
                             }
                         }
                     }
@@ -268,25 +288,154 @@ impl Supervisor {
         tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
         self.emit(id, StreamState::Failed, Some(detail));
     }
+    fn record_client_added(&self, id: &str, client: SrtClientAddress) {
+        let event = {
+            let mut streams = match self.inner.lock() {
+                Ok(streams) => streams,
+                Err(_) => return,
+            };
+            let Some(managed) = streams.get_mut(id) else {
+                return;
+            };
+            if managed.clients.contains(&client) {
+                return;
+            }
+            managed.clients.push(client);
+            event_from_managed(id, managed, managed.state, None)
+        };
+        let _ = self.events.send(event);
+    }
+    fn record_client_removed(&self, id: &str, client: &SrtClientAddress) {
+        let event = {
+            let mut streams = match self.inner.lock() {
+                Ok(streams) => streams,
+                Err(_) => return,
+            };
+            let Some(managed) = streams.get_mut(id) else {
+                return;
+            };
+            let previous_len = managed.clients.len();
+            managed.clients.retain(|existing| existing != client);
+            if managed.clients.len() == previous_len {
+                return;
+            }
+            event_from_managed(id, managed, managed.state, None)
+        };
+        let _ = self.events.send(event);
+    }
     fn emit(&self, id: &str, state: StreamState, detail: Option<String>) {
-        let _ = self.events.send(StreamEvent {
-            stream_id: id.into(),
-            state,
-            detail,
-            port: None,
-            latency_ms: None,
-            mode: None,
-            loop_count: None,
-            clients: Vec::new(),
-        });
+        let event = {
+            let streams = self.inner.lock().ok();
+            streams
+                .as_ref()
+                .and_then(|streams| streams.get(id))
+                .map(|managed| event_from_managed(id, managed, state, detail.clone()))
+                .unwrap_or_else(|| StreamEvent {
+                    stream_id: id.into(),
+                    state,
+                    detail,
+                    port: None,
+                    latency_ms: None,
+                    mode: None,
+                    loop_count: None,
+                    clients: Vec::new(),
+                })
+        };
+        let _ = self.events.send(event);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Supervisor;
+    use gstreamer as gst;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::{ManagedStream, Supervisor};
+    use crate::{
+        domain::{ProcessingMode, SrtClientAddress, StreamState},
+        streams::SrtListenerConfig,
+    };
+
+    fn supervisor_with_test_stream(id: &str) -> Supervisor {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        supervisor
+            .inner
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .insert(
+                id.into(),
+                ManagedStream {
+                    pipeline: gst::Pipeline::new(),
+                    state: StreamState::Running,
+                    restarts: 0,
+                    config: SrtListenerConfig::new(9000, 120).unwrap(),
+                    mode: ProcessingMode::RemuxCopy,
+                    clients: Vec::new(),
+                },
+            );
+        supervisor
+    }
+
     #[test]
     fn starts_with_no_active_streams() {
         assert!(Supervisor::new().states().is_empty());
+    }
+
+    #[test]
+    fn tracks_unique_clients_and_removes_them() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let mut events = supervisor.subscribe();
+        let client = SrtClientAddress {
+            ip: "192.0.2.10".into(),
+            port: 54321,
+        };
+        let other_client = SrtClientAddress {
+            ip: "192.0.2.11".into(),
+            port: 54322,
+        };
+
+        supervisor.record_client_added("feed", client.clone());
+        assert_eq!(events.try_recv().unwrap().clients, vec![client.clone()]);
+
+        supervisor.record_client_added("feed", client.clone());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(supervisor.states()[0].clients, vec![client.clone()]);
+
+        supervisor.record_client_added("feed", other_client.clone());
+        assert_eq!(
+            events.try_recv().unwrap().clients,
+            vec![client.clone(), other_client.clone()]
+        );
+
+        supervisor.record_client_removed("feed", &client);
+        assert_eq!(
+            events.try_recv().unwrap().clients,
+            vec![other_client.clone()]
+        );
+        assert_eq!(supervisor.states()[0].clients, vec![other_client.clone()]);
+
+        supervisor.record_client_removed("feed", &client);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        supervisor.record_client_removed("feed", &other_client);
+        assert!(events.try_recv().unwrap().clients.is_empty());
+        assert!(supervisor.states()[0].clients.is_empty());
+    }
+
+    #[test]
+    fn ignores_client_updates_for_unknown_streams() {
+        let supervisor = Supervisor::new();
+        let mut events = supervisor.subscribe();
+        let client = SrtClientAddress {
+            ip: "192.0.2.10".into(),
+            port: 54321,
+        };
+
+        supervisor.record_client_added("missing", client.clone());
+        supervisor.record_client_removed("missing", &client);
+
+        assert!(supervisor.states().is_empty());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 }
