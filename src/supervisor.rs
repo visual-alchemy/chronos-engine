@@ -1,0 +1,292 @@
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::Result;
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use tokio::sync::broadcast;
+
+use crate::{
+    domain::{ProcessingMode, StreamEvent, StreamState},
+    gst_runtime::{build_h264_aac_copy_pipeline, build_hybrid_pipeline, build_transcode_pipeline},
+    streams::SrtListenerConfig,
+};
+
+#[derive(Clone)]
+pub struct Supervisor {
+    inner: Arc<Mutex<HashMap<String, ManagedStream>>>,
+    events: broadcast::Sender<StreamEvent>,
+}
+struct ManagedStream {
+    pipeline: gst::Pipeline,
+    state: StreamState,
+    /// Tracks how many times we have looped (informational only, no cap).
+    restarts: u64,
+    config: SrtListenerConfig,
+    mode: ProcessingMode,
+}
+
+impl Supervisor {
+    pub fn new() -> Self {
+        let (events, _) = broadcast::channel(128);
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            events,
+        }
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
+        self.events.subscribe()
+    }
+    pub fn states(&self) -> Vec<StreamEvent> {
+        self.inner
+            .lock()
+            .map(|streams| {
+                streams
+                    .iter()
+                    .map(|(id, managed)| StreamEvent {
+                        stream_id: id.clone(),
+                        state: managed.state,
+                        detail: None,
+                        port: Some(managed.config.port),
+                        latency_ms: Some(managed.config.latency_ms),
+                        mode: Some(managed.mode.clone()),
+                        loop_count: Some(managed.restarts),
+                        clients: Vec::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn start_copy(&self, id: String, path: &Path, config: SrtListenerConfig) -> Result<()> {
+        self.start(
+            id,
+            build_h264_aac_copy_pipeline(path, config)?,
+            config,
+            ProcessingMode::RemuxCopy,
+        )
+    }
+    pub fn start_transcode(
+        &self,
+        id: String,
+        path: &Path,
+        config: SrtListenerConfig,
+    ) -> Result<()> {
+        self.start(
+            id,
+            build_transcode_pipeline(path, config)?,
+            config,
+            ProcessingMode::FullTranscode,
+        )
+    }
+    pub fn start_hybrid(
+        &self,
+        id: String,
+        path: &Path,
+        config: SrtListenerConfig,
+        mode: ProcessingMode,
+    ) -> Result<()> {
+        let copy_video = matches!(mode, ProcessingMode::CopyVideoEncodeAudio);
+        self.start(
+            id,
+            build_hybrid_pipeline(path, config, copy_video)?,
+            config,
+            mode,
+        )
+    }
+    fn start(
+        &self,
+        id: String,
+        pipeline: gst::Pipeline,
+        config: SrtListenerConfig,
+        mode: ProcessingMode,
+    ) -> Result<()> {
+        self.emit(&id, StreamState::Starting, None);
+        pipeline.set_state(gst::State::Playing)?;
+        self.inner
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .insert(
+                id.clone(),
+                ManagedStream {
+                    pipeline,
+                    state: StreamState::WaitingForCaller,
+                    restarts: 0u64,
+                    config,
+                    mode,
+                },
+            );
+        self.emit(&id, StreamState::WaitingForCaller, None);
+
+        // Spawn a monitor thread that re-acquires the bus after each restart
+        // so it keeps watching across NULL → PLAYING cycles.
+        let supervisor = self.clone();
+        std::thread::spawn(move || {
+            supervisor.monitor_loop(&id);
+        });
+        Ok(())
+    }
+
+    /// Bus monitor loop that survives pipeline restarts.
+    ///
+    /// After each EOS the pipeline is restarted (NULL → PLAYING). The old bus
+    /// reference is flushed by the NULL transition, so we re-acquire the bus
+    /// from the pipeline after every restart to keep receiving messages.
+    fn monitor_loop(&self, id: &str) {
+        loop {
+            // Fetch the current bus from the live pipeline.
+            let bus = {
+                let streams = match self.inner.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                match streams.get(id) {
+                    Some(m) => m.pipeline.bus(),
+                    None => return, // stream was stopped/removed
+                }
+            };
+            let Some(bus) = bus else { return };
+
+            // Drain this bus until EOS, error, or the pipeline is removed.
+            loop {
+                let Some(message) = bus.timed_pop(gst::ClockTime::from_seconds(1)) else {
+                    // Timeout — check if the stream still exists.
+                    if !self
+                        .inner
+                        .lock()
+                        .map(|s| s.contains_key(id))
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    continue;
+                };
+                match message.view() {
+                    gst::MessageView::StateChanged(sc) => {
+                        // Detect when the pipeline itself (not a sub-element)
+                        // transitions to Playing. We compare object names since
+                        // comparing GObject pointers across lock boundaries is
+                        // unsafe and complex.
+                        let src_name = message.src().map(|o| o.name().to_string());
+                        let pipeline_name = self
+                            .inner
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.get(id).map(|m| m.pipeline.name().to_string()));
+                        let is_pipeline_msg = src_name.is_some() && src_name == pipeline_name;
+                        if is_pipeline_msg && sc.current() == gst::State::Playing {
+                            if let Ok(mut streams) = self.inner.lock() {
+                                if let Some(managed) = streams.get_mut(id) {
+                                    if managed.state == StreamState::WaitingForCaller {
+                                        managed.state = StreamState::Running;
+                                        self.emit(id, StreamState::Running, None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    gst::MessageView::Eos(..) => {
+                        // EOS: record and restart, then break to re-acquire the bus.
+                        self.record_eos(id);
+                        break;
+                    }
+                    gst::MessageView::Error(error) => {
+                        self.record_error(id, error.error().to_string());
+                        return; // Fatal — stop monitoring.
+                    }
+                    _ => {}
+                }
+            }
+
+            // If the stream was removed (stopped), exit.
+            if !self
+                .inner
+                .lock()
+                .map(|s| s.contains_key(id))
+                .unwrap_or(false)
+            {
+                return;
+            }
+        }
+    }
+    pub fn stop(&self, id: &str) -> Result<()> {
+        self.emit(id, StreamState::Stopping, None);
+        if let Some(managed) = self
+            .inner
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .remove(id)
+        {
+            managed.pipeline.set_state(gst::State::Null)?;
+        }
+        self.emit(id, StreamState::Stopped, None);
+        Ok(())
+    }
+    pub fn record_eos(&self, id: &str) {
+        // Restart the pipeline from scratch on every EOS so the file loops
+        // indefinitely. A seek_simple is unreliable once srtsink holds an
+        // open UDP socket: the flush propagates into the sink and can cause
+        // VLC to lose the connection. Transitioning NULL → PLAYING re-opens
+        // the file while the SRT listener port stays bound.
+        let pipeline = {
+            let mut streams = match self.inner.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let Some(managed) = streams.get_mut(id) else {
+                return;
+            };
+            managed.restarts = managed.restarts.saturating_add(1);
+            managed.state = StreamState::Looping;
+            managed.pipeline.clone()
+        };
+        // Stop and immediately restart to loop the file.
+        if let Err(err) = pipeline.set_state(gst::State::Null) {
+            tracing::warn!(stream_id = id, ?err, "EOS: failed to set pipeline to Null");
+        }
+        if let Err(err) = pipeline.set_state(gst::State::Playing) {
+            tracing::warn!(stream_id = id, ?err, "EOS: failed to restart pipeline");
+            // Mark failed only when we can't recover
+            if let Ok(mut streams) = self.inner.lock() {
+                if let Some(managed) = streams.get_mut(id) {
+                    managed.state = StreamState::Failed;
+                }
+            }
+            self.emit(id, StreamState::Failed, Some("EOS restart failed".into()));
+            return;
+        }
+        self.emit(id, StreamState::Looping, None);
+    }
+    fn record_error(&self, id: &str, detail: String) {
+        if let Ok(mut streams) = self.inner.lock()
+            && let Some(managed) = streams.get_mut(id)
+        {
+            managed.state = StreamState::Failed;
+        }
+        tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
+        self.emit(id, StreamState::Failed, Some(detail));
+    }
+    fn emit(&self, id: &str, state: StreamState, detail: Option<String>) {
+        let _ = self.events.send(StreamEvent {
+            stream_id: id.into(),
+            state,
+            detail,
+            port: None,
+            latency_ms: None,
+            mode: None,
+            loop_count: None,
+            clients: Vec::new(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Supervisor;
+    #[test]
+    fn starts_with_no_active_streams() {
+        assert!(Supervisor::new().states().is_empty());
+    }
+}
