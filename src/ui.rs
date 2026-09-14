@@ -20,8 +20,13 @@ mod tests {
 
     #[test]
     fn dashboard_formats_multiple_and_ipv6_clients() {
-        assert!(JS.contains("Clients"));
-        assert!(JS.contains("client.ip.includes(':')"));
-        assert!(JS.contains("[${client.ip}]:${client.port}"));
+        assert!(JS.contains("function formatClientSummary(value)"));
+        assert!(JS.contains("clientsLine.textContent = formatClientSummary(stream.clients);"));
+        assert!(JS.contains("Array.isArray(value)"));
+        assert!(JS.contains("Number.isInteger(client.port)"));
+        assert!(JS.contains("? 'Client' : 'Clients'"));
+        assert!(JS.contains(": ${addresses.join(', ')}"));
+        assert!(JS.contains("ip.includes(':')"));
+        assert!(JS.contains("[${ip}]:${client.port}"));
     }
 }

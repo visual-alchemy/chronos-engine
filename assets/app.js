@@ -53,6 +53,28 @@ function callerUrl(host, stream) {
   return `srt://${host}:${stream.port}?mode=caller&latency=${stream.latency_ms || 120}`;
 }
 
+function formatClientSummary(value) {
+  const clients = Array.isArray(value) ? value : [];
+  const addresses = clients.flatMap((client) => {
+    if (
+      !client ||
+      typeof client.ip !== 'string' ||
+      !client.ip.trim() ||
+      !Number.isInteger(client.port) ||
+      client.port < 0 ||
+      client.port > 65535
+    ) {
+      return [];
+    }
+
+    const ip = client.ip.trim();
+    return [ip.includes(':') ? `[${ip}]:${client.port}` : `${ip}:${client.port}`];
+  });
+
+  if (addresses.length === 0) return 'No client connected';
+  return `${addresses.length === 1 ? 'Client' : 'Clients'}: ${addresses.join(', ')}`;
+}
+
 function getTimestamp() {
   const now = new Date();
   return now.toTimeString().split(' ')[0];
@@ -272,16 +294,7 @@ async function loadStreams() {
 
       card.querySelector('.stream-id').textContent = stream.stream_id;
       stateBadge.textContent = stream.state.replaceAll('_', ' ');
-
-      const clientAddresses = (stream.clients || []).map((client) => {
-        const address = client.ip.includes(':')
-          ? `[${client.ip}]:${client.port}`
-          : `${client.ip}:${client.port}`;
-        return address;
-      });
-      clientsLine.textContent = clientAddresses.length === 0
-        ? 'No client connected'
-        : `${clientAddresses.length === 1 ? 'Client' : 'Clients'}: ${clientAddresses.join(', ')}`;
+      clientsLine.textContent = formatClientSummary(stream.clients);
 
       if (stream.state === 'running' || stream.state === 'waiting_for_caller') {
         pulseDot.style.background = 'var(--emerald)';
