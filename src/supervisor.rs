@@ -350,6 +350,23 @@ impl Supervisor {
     }
 
     fn stop_owns_pipeline(&self, id: &str, pipeline: &gst::Pipeline) -> bool {
+        let _publication = match self.publication.lock() {
+            Ok(publication) => publication,
+            Err(_) => return false,
+        };
+        let pending_owns = self
+            .pending_starts
+            .lock()
+            .ok()
+            .and_then(|pending| {
+                pending.get(id).map(|pending_start| {
+                    pending_start.pipeline == *pipeline && pending_start.canceled
+                })
+            })
+            .unwrap_or(false);
+        if pending_owns {
+            return true;
+        }
         self.inner
             .lock()
             .ok()
@@ -882,7 +899,6 @@ impl Supervisor {
         }
     }
     fn record_error(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
-        tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
         let transitioned = self
             .inner
             .lock()
@@ -902,6 +918,7 @@ impl Supervisor {
             })
             .unwrap_or(false);
         if transitioned {
+            tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
             self.emit_if_current_state(id, expected_pipeline, StreamState::Failed, Some(detail));
         }
     }
@@ -1224,6 +1241,75 @@ mod tests {
         assert_eq!(pipeline.current_state(), gst::State::Null);
         assert!(supervisor.states().is_empty());
         assert!(supervisor.pending_starts.lock().unwrap().is_empty());
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                StreamState::Starting,
+                StreamState::Stopping,
+                StreamState::Stopped
+            ]
+        );
+    }
+
+    #[test]
+    fn canceled_pending_start_does_not_compete_with_stop_cleanup() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add(&gst::ElementFactory::make("srtsink").build().unwrap())
+            .unwrap();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut events = supervisor.subscribe();
+        let (stop_entered_tx, stop_entered_rx) = mpsc::channel();
+        let (release_stop_tx, release_stop_rx) = mpsc::channel();
+        let stop_supervisor = supervisor.clone();
+        let stop_thread = Arc::new(Mutex::new(None));
+        let recorded_stop_thread = stop_thread.clone();
+        let null_calls = Arc::new(AtomicUsize::new(0));
+        let observed_null_calls = null_calls.clone();
+
+        let error = supervisor
+            .start_with(
+                "feed".into(),
+                pipeline.clone(),
+                SrtListenerConfig::new(9000, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+                move || {
+                    let handle = thread::spawn(move || {
+                        stop_supervisor.stop_with("feed", move |pipeline| {
+                            stop_entered_tx.send(()).unwrap();
+                            release_stop_rx.recv().unwrap();
+                            observed_null_calls.fetch_add(1, Ordering::SeqCst);
+                            pipeline.set_state(gst::State::Null)?;
+                            Ok(())
+                        })
+                    });
+                    *recorded_stop_thread.lock().unwrap() = Some(handle);
+                    stop_entered_rx.recv().unwrap();
+                },
+                |_| {
+                    panic!("canceled pending start must not call Playing");
+                },
+                |_, _, _| panic!("canceled pending start must not start monitoring"),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no longer current"));
+        assert_eq!(null_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pipeline.current_state(), gst::State::Ready);
+        assert!(supervisor.pending_starts.lock().unwrap()["feed"].canceled);
+
+        release_stop_tx.send(()).unwrap();
+        let stop_result = stop_thread.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(stop_result.is_ok());
+        assert_eq!(null_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert!(supervisor.pending_starts.lock().unwrap().is_empty());
+        assert!(supervisor.states().is_empty());
         let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
             .map(|event| event.state)
             .collect();
