@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
+use gio::prelude::*;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use tokio::sync::broadcast;
@@ -47,6 +48,26 @@ fn event_from_managed(
         loop_count: Some(managed.restarts),
         clients: managed.clients.clone(),
     }
+}
+
+fn socket_address_to_client(address: &gio::SocketAddress) -> Option<SrtClientAddress> {
+    let address = address.clone().downcast::<gio::InetSocketAddress>().ok()?;
+    Some(SrtClientAddress {
+        ip: address.address().to_string().into(),
+        port: address.port(),
+    })
+}
+
+fn find_srt_sink(pipeline: &gst::Pipeline) -> Option<gst::Element> {
+    pipeline
+        .iterate_elements()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|element| {
+            element
+                .factory()
+                .is_some_and(|factory| factory.name() == "srtsink")
+        })
 }
 
 impl Supervisor {
@@ -116,14 +137,14 @@ impl Supervisor {
         mode: ProcessingMode,
     ) -> Result<()> {
         self.emit(&id, StreamState::Starting, None);
-        pipeline.set_state(gst::State::Playing)?;
+        self.attach_srt_client_handlers(&id, &pipeline)?;
         self.inner
             .lock()
             .expect("supervisor mutex poisoned")
             .insert(
                 id.clone(),
                 ManagedStream {
-                    pipeline,
+                    pipeline: pipeline.clone(),
                     state: StreamState::WaitingForCaller,
                     restarts: 0u64,
                     config,
@@ -131,6 +152,26 @@ impl Supervisor {
                     clients: Vec::new(),
                 },
             );
+        if let Err(error) = pipeline.set_state(gst::State::Playing) {
+            {
+                let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+                // A concurrent start may have replaced this entry already.
+                if streams
+                    .get(&id)
+                    .is_some_and(|managed| managed.pipeline == pipeline)
+                {
+                    streams.remove(&id);
+                }
+            }
+            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+                tracing::warn!(
+                    stream_id = id,
+                    ?cleanup_error,
+                    "Failed to stop unsuccessful pipeline"
+                );
+            }
+            return Err(error.into());
+        }
         self.emit(&id, StreamState::WaitingForCaller, None);
 
         // Spawn a monitor thread that re-acquires the bus after each restart
@@ -139,6 +180,54 @@ impl Supervisor {
         std::thread::spawn(move || {
             supervisor.monitor_loop(&id);
         });
+        Ok(())
+    }
+
+    fn attach_srt_client_handlers(&self, id: &str, pipeline: &gst::Pipeline) -> Result<()> {
+        let sink = find_srt_sink(pipeline)
+            .ok_or_else(|| anyhow::anyhow!("Stream {id} pipeline has no srtsink"))?;
+        for signal in ["caller-added", "caller-removed"] {
+            let id = id.to_owned();
+            // Avoid an ownership cycle: inner -> pipeline -> sink -> callback -> inner.
+            let inner = Arc::downgrade(&self.inner);
+            let publication = self.publication.clone();
+            let events = self.events.clone();
+            sink.connect(signal, false, move |values| {
+                let Some(address) = values
+                    .get(2)
+                    .and_then(|value| value.get::<gio::SocketAddress>().ok())
+                else {
+                    tracing::warn!(
+                        stream_id = id,
+                        signal,
+                        "Ignoring caller signal with malformed socket address"
+                    );
+                    return None;
+                };
+                let Some(client) = socket_address_to_client(&address) else {
+                    tracing::warn!(
+                        stream_id = id,
+                        signal,
+                        "Ignoring caller signal with unsupported socket address"
+                    );
+                    return None;
+                };
+                let Some(inner) = inner.upgrade() else {
+                    return None;
+                };
+                let supervisor = Supervisor {
+                    inner,
+                    publication: publication.clone(),
+                    events: events.clone(),
+                };
+                if signal == "caller-added" {
+                    supervisor.record_client_added(&id, client);
+                } else {
+                    supervisor.record_client_removed(&id, &client);
+                }
+                None
+            });
+        }
         Ok(())
     }
 
@@ -235,12 +324,11 @@ impl Supervisor {
     }
     pub fn stop(&self, id: &str) -> Result<()> {
         self.emit(id, StreamState::Stopping, None);
-        if let Some(managed) = self
-            .inner
-            .lock()
-            .expect("supervisor mutex poisoned")
-            .remove(id)
-        {
+        let managed = {
+            let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+            streams.remove(id)
+        };
+        if let Some(managed) = managed {
             managed.pipeline.set_state(gst::State::Null)?;
         }
         self.emit(id, StreamState::Stopped, None);
@@ -361,6 +449,7 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
+    use gio::prelude::*;
     use std::{
         sync::{TryLockError, mpsc},
         thread,
@@ -368,9 +457,10 @@ mod tests {
     };
 
     use gstreamer as gst;
+    use gstreamer::prelude::*;
     use tokio::sync::broadcast::error::TryRecvError;
 
-    use super::{ManagedStream, Supervisor};
+    use super::{ManagedStream, Supervisor, find_srt_sink, socket_address_to_client};
     use crate::{
         domain::{ProcessingMode, SrtClientAddress, StreamState},
         streams::SrtListenerConfig,
@@ -395,6 +485,140 @@ mod tests {
                 },
             );
         supervisor
+    }
+
+    #[test]
+    fn converts_inet_socket_addresses() {
+        for (ip, port) in [("192.0.2.10", 54321), ("2001:db8::10", 54322)] {
+            let inet = gio::InetAddress::from_string(ip).unwrap();
+            let address: gio::SocketAddress = gio::InetSocketAddress::new(&inet, port).upcast();
+            assert_eq!(
+                socket_address_to_client(&address),
+                Some(SrtClientAddress {
+                    ip: ip.into(),
+                    port
+                })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_non_ip_socket_addresses() {
+        let address = gio::UnixSocketAddress::new(std::path::Path::new("/tmp/chronos-test"));
+        assert_eq!(socket_address_to_client(&address.upcast()), None);
+    }
+
+    #[test]
+    fn finds_srt_sink_by_factory_not_element_name() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let impostor = gst::ElementFactory::make("fakesink")
+            .name("srtsink")
+            .build()
+            .unwrap();
+        pipeline.add(&impostor).unwrap();
+        assert!(find_srt_sink(&pipeline).is_none());
+        let sink = gst::ElementFactory::make("srtsink")
+            .name("output")
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        assert_eq!(find_srt_sink(&pipeline), Some(sink));
+    }
+
+    #[test]
+    fn rejects_start_without_srt_sink() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let mut events = supervisor.subscribe();
+        let pipeline = gst::Pipeline::new();
+        let error = supervisor
+            .start(
+                "feed".into(),
+                pipeline.clone(),
+                SrtListenerConfig::new(9000, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("srtsink"));
+        assert!(supervisor.states().is_empty());
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(events.try_recv().unwrap().state, StreamState::Starting);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn caller_signals_update_clients_without_playback() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        let sink = gst::ElementFactory::make("srtsink").build().unwrap();
+        pipeline.add(&sink).unwrap();
+        supervisor
+            .attach_srt_client_handlers("feed", &pipeline)
+            .unwrap();
+        let mut events = supervisor.subscribe();
+        let inet = gio::InetAddress::from_string("2001:db8::10").unwrap();
+        let address: gio::SocketAddress = gio::InetSocketAddress::new(&inet, 54321).upcast();
+        sink.emit_by_name::<()>("caller-added", &[&1i32, &address]);
+        assert_eq!(
+            events.try_recv().unwrap().clients,
+            vec![SrtClientAddress {
+                ip: "2001:db8::10".into(),
+                port: 54321,
+            }]
+        );
+        sink.emit_by_name::<()>("caller-removed", &[&1i32, &address]);
+        assert!(events.try_recv().unwrap().clients.is_empty());
+        let missing: Option<gio::SocketAddress> = None;
+        sink.emit_by_name::<()>("caller-added", &[&1i32, &missing]);
+        sink.emit_by_name::<()>("caller-removed", &[&1i32, &missing]);
+        #[cfg(unix)]
+        {
+            let unsupported: gio::SocketAddress =
+                gio::UnixSocketAddress::new(std::path::Path::new("/tmp/chronos-test")).upcast();
+            sink.emit_by_name::<()>("caller-added", &[&1i32, &unsupported]);
+            sink.emit_by_name::<()>("caller-removed", &[&1i32, &unsupported]);
+        }
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        assert!(supervisor.states()[0].clients.is_empty());
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+    }
+
+    #[test]
+    fn rolls_back_failed_playback_without_opening_listener() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
+        let sink = gst::ElementFactory::make("srtsink").build().unwrap();
+        // Keep the sink from reaching Paused/Playing so the test cannot bind a socket.
+        sink.set_locked_state(true);
+        let directory = tempfile::tempdir().unwrap();
+        let source = gst::ElementFactory::make("filesrc")
+            .property(
+                "location",
+                directory.path().join("missing.ts").to_str().unwrap(),
+            )
+            .build()
+            .unwrap();
+        pipeline.add_many([&source, &sink]).unwrap();
+        source.link(&sink).unwrap();
+        let result = supervisor.start(
+            "feed".into(),
+            pipeline.clone(),
+            SrtListenerConfig::new(9000, 120).unwrap(),
+            ProcessingMode::RemuxCopy,
+        );
+        let pipeline_state = pipeline.current_state();
+
+        // A locked child does not follow its parent back to Null. Unlock it and
+        // clean it up explicitly before the final reference is dropped.
+        sink.set_locked_state(false);
+        sink.set_state(gst::State::Null).unwrap();
+
+        assert!(result.is_err());
+        assert!(supervisor.states().is_empty());
+        assert_eq!(pipeline_state, gst::State::Null);
     }
 
     #[test]
