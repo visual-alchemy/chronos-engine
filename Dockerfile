@@ -1,8 +1,11 @@
 FROM rust:1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && printf 'fn main() {}' > src/main.rs && cargo build --release
 COPY src ./src
+COPY config ./config
+COPY assets ./assets
 RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
