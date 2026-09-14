@@ -138,20 +138,7 @@ impl Supervisor {
     ) -> Result<()> {
         self.emit(&id, StreamState::Starting, None);
         self.attach_srt_client_handlers(&id, &pipeline)?;
-        self.inner
-            .lock()
-            .expect("supervisor mutex poisoned")
-            .insert(
-                id.clone(),
-                ManagedStream {
-                    pipeline: pipeline.clone(),
-                    state: StreamState::WaitingForCaller,
-                    restarts: 0u64,
-                    config,
-                    mode,
-                    clients: Vec::new(),
-                },
-            );
+        self.register_start(id.clone(), pipeline.clone(), config, mode)?;
         if let Err(error) = pipeline.set_state(gst::State::Playing) {
             {
                 let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
@@ -172,14 +159,92 @@ impl Supervisor {
             }
             return Err(error.into());
         }
-        self.emit(&id, StreamState::WaitingForCaller, None);
+        self.finalize_start(&id, &pipeline, |supervisor, id, pipeline| {
+            // Re-acquire the bus after each restart so monitoring survives
+            // NULL → PLAYING cycles.
+            std::thread::spawn(move || supervisor.monitor_loop(&id, &pipeline));
+        })
+    }
 
-        // Spawn a monitor thread that re-acquires the bus after each restart
-        // so it keeps watching across NULL → PLAYING cycles.
-        let supervisor = self.clone();
-        std::thread::spawn(move || {
-            supervisor.monitor_loop(&id);
-        });
+    fn register_start(
+        &self,
+        id: String,
+        pipeline: gst::Pipeline,
+        config: SrtListenerConfig,
+        mode: ProcessingMode,
+    ) -> Result<()> {
+        let registered = {
+            let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+            if streams.contains_key(&id) {
+                false
+            } else {
+                streams.insert(
+                    id.clone(),
+                    ManagedStream {
+                        pipeline: pipeline.clone(),
+                        state: StreamState::WaitingForCaller,
+                        restarts: 0,
+                        config,
+                        mode,
+                        clients: Vec::new(),
+                    },
+                );
+                true
+            }
+        };
+        if registered {
+            return Ok(());
+        }
+
+        if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+            tracing::warn!(
+                stream_id = id,
+                ?cleanup_error,
+                "Failed to stop rejected pipeline"
+            );
+        }
+        anyhow::bail!("Stream {id} is already managed")
+    }
+
+    fn finalize_start<F>(&self, id: &str, pipeline: &gst::Pipeline, start_monitor: F) -> Result<()>
+    where
+        F: FnOnce(Supervisor, String, gst::Pipeline),
+    {
+        let finalized = {
+            let _publication = self
+                .publication
+                .lock()
+                .expect("supervisor publication mutex poisoned");
+            let event = {
+                let streams = self.inner.lock().expect("supervisor mutex poisoned");
+                streams.get(id).and_then(|managed| {
+                    (managed.pipeline == *pipeline
+                        && managed.state == StreamState::WaitingForCaller)
+                        .then(|| {
+                            event_from_managed(id, managed, StreamState::WaitingForCaller, None)
+                        })
+                })
+            };
+            if let Some(event) = event {
+                let _ = self.events.send(event);
+                true
+            } else {
+                false
+            }
+        };
+
+        if !finalized {
+            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+                tracing::warn!(
+                    stream_id = id,
+                    ?cleanup_error,
+                    "Failed to stop stale pipeline"
+                );
+            }
+            anyhow::bail!("Stream {id} start is no longer current")
+        }
+
+        start_monitor(self.clone(), id.to_owned(), pipeline.clone());
         Ok(())
     }
 
@@ -236,31 +301,26 @@ impl Supervisor {
     /// After each EOS the pipeline is restarted (NULL → PLAYING). The old bus
     /// reference is flushed by the NULL transition, so we re-acquire the bus
     /// from the pipeline after every restart to keep receiving messages.
-    fn monitor_loop(&self, id: &str) {
+    fn monitor_bus(&self, id: &str, pipeline: &gst::Pipeline) -> Option<gst::Bus> {
+        let is_current = {
+            let streams = self.inner.lock().ok()?;
+            let managed = streams.get(id)?;
+            managed.pipeline == *pipeline && managed.state != StreamState::Stopping
+        };
+        is_current.then(|| pipeline.bus()).flatten()
+    }
+
+    fn monitor_loop(&self, id: &str, pipeline: &gst::Pipeline) {
         loop {
-            // Fetch the current bus from the live pipeline.
-            let bus = {
-                let streams = match self.inner.lock() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                match streams.get(id) {
-                    Some(m) => m.pipeline.bus(),
-                    None => return, // stream was stopped/removed
-                }
-            };
+            // Fetch the bus only while this exact pipeline still owns the ID.
+            let bus = self.monitor_bus(id, pipeline);
             let Some(bus) = bus else { return };
 
             // Drain this bus until EOS, error, or the pipeline is removed.
             loop {
                 let Some(message) = bus.timed_pop(gst::ClockTime::from_seconds(1)) else {
                     // Timeout — check if the stream still exists.
-                    if !self
-                        .inner
-                        .lock()
-                        .map(|s| s.contains_key(id))
-                        .unwrap_or(false)
-                    {
+                    if self.monitor_bus(id, pipeline).is_none() {
                         return;
                     }
                     continue;
@@ -272,16 +332,14 @@ impl Supervisor {
                         // comparing GObject pointers across lock boundaries is
                         // unsafe and complex.
                         let src_name = message.src().map(|o| o.name().to_string());
-                        let pipeline_name = self
-                            .inner
-                            .lock()
-                            .ok()
-                            .and_then(|s| s.get(id).map(|m| m.pipeline.name().to_string()));
+                        let pipeline_name = Some(pipeline.name().to_string());
                         let is_pipeline_msg = src_name.is_some() && src_name == pipeline_name;
                         if is_pipeline_msg && sc.current() == gst::State::Playing {
                             let state_changed = if let Ok(mut streams) = self.inner.lock() {
                                 if let Some(managed) = streams.get_mut(id) {
-                                    if managed.state == StreamState::WaitingForCaller {
+                                    if managed.pipeline == *pipeline
+                                        && managed.state == StreamState::WaitingForCaller
+                                    {
                                         managed.state = StreamState::Running;
                                         true
                                     } else {
@@ -294,17 +352,22 @@ impl Supervisor {
                                 false
                             };
                             if state_changed {
-                                self.emit(id, StreamState::Running, None);
+                                self.emit_if_current_state(
+                                    id,
+                                    pipeline,
+                                    StreamState::Running,
+                                    None,
+                                );
                             }
                         }
                     }
                     gst::MessageView::Eos(..) => {
                         // EOS: record and restart, then break to re-acquire the bus.
-                        self.record_eos(id);
+                        self.record_eos(id, pipeline);
                         break;
                     }
                     gst::MessageView::Error(error) => {
-                        self.record_error(id, error.error().to_string());
+                        self.record_error(id, pipeline, error.error().to_string());
                         return; // Fatal — stop monitoring.
                     }
                     _ => {}
@@ -312,29 +375,87 @@ impl Supervisor {
             }
 
             // If the stream was removed (stopped), exit.
-            if !self
-                .inner
-                .lock()
-                .map(|s| s.contains_key(id))
-                .unwrap_or(false)
-            {
+            if self.monitor_bus(id, pipeline).is_none() {
                 return;
             }
         }
     }
     pub fn stop(&self, id: &str) -> Result<()> {
-        self.emit(id, StreamState::Stopping, None);
-        let managed = {
-            let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-            streams.remove(id)
+        let pipeline = {
+            let _publication = self
+                .publication
+                .lock()
+                .expect("supervisor publication mutex poisoned");
+            let (event, pipeline) = {
+                let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+                if let Some(managed) = streams.get_mut(id) {
+                    managed.state = StreamState::Stopping;
+                    (
+                        event_from_managed(id, managed, StreamState::Stopping, None),
+                        Some(managed.pipeline.clone()),
+                    )
+                } else {
+                    (
+                        StreamEvent {
+                            stream_id: id.into(),
+                            state: StreamState::Stopping,
+                            detail: None,
+                            port: None,
+                            latency_ms: None,
+                            mode: None,
+                            loop_count: None,
+                            clients: Vec::new(),
+                        },
+                        None,
+                    )
+                }
+            };
+            let _ = self.events.send(event);
+            pipeline
         };
-        if let Some(managed) = managed {
-            managed.pipeline.set_state(gst::State::Null)?;
+
+        let stop_result = if let Some(pipeline) = pipeline.as_ref() {
+            pipeline.set_state(gst::State::Null).map(|_| ())
+        } else {
+            Ok(())
+        };
+
+        {
+            let _publication = self
+                .publication
+                .lock()
+                .expect("supervisor publication mutex poisoned");
+            let removed = {
+                let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+                pipeline.as_ref().and_then(|pipeline| {
+                    let is_current = streams
+                        .get(id)
+                        .is_some_and(|managed| managed.pipeline == *pipeline);
+                    is_current.then(|| streams.remove(id)).flatten()
+                })
+            };
+            if stop_result.is_ok() {
+                let event = removed
+                    .as_ref()
+                    .map(|managed| event_from_managed(id, managed, StreamState::Stopped, None))
+                    .unwrap_or_else(|| StreamEvent {
+                        stream_id: id.into(),
+                        state: StreamState::Stopped,
+                        detail: None,
+                        port: None,
+                        latency_ms: None,
+                        mode: None,
+                        loop_count: None,
+                        clients: Vec::new(),
+                    });
+                let _ = self.events.send(event);
+            }
         }
-        self.emit(id, StreamState::Stopped, None);
+
+        stop_result?;
         Ok(())
     }
-    pub fn record_eos(&self, id: &str) {
+    fn record_eos(&self, id: &str, expected_pipeline: &gst::Pipeline) {
         // Restart the pipeline from scratch on every EOS so the file loops
         // indefinitely. A seek_simple is unreliable once srtsink holds an
         // open UDP socket: the flush propagates into the sink and can cause
@@ -348,6 +469,9 @@ impl Supervisor {
             let Some(managed) = streams.get_mut(id) else {
                 return;
             };
+            if managed.pipeline != *expected_pipeline || managed.state == StreamState::Stopping {
+                return;
+            }
             managed.restarts = managed.restarts.saturating_add(1);
             managed.state = StreamState::Looping;
             managed.pipeline.clone()
@@ -360,23 +484,33 @@ impl Supervisor {
             tracing::warn!(stream_id = id, ?err, "EOS: failed to restart pipeline");
             // Mark failed only when we can't recover
             if let Ok(mut streams) = self.inner.lock() {
-                if let Some(managed) = streams.get_mut(id) {
+                if let Some(managed) = streams.get_mut(id)
+                    && managed.pipeline == *expected_pipeline
+                    && managed.state != StreamState::Stopping
+                {
                     managed.state = StreamState::Failed;
                 }
             }
-            self.emit(id, StreamState::Failed, Some("EOS restart failed".into()));
+            self.emit_if_current_state(
+                id,
+                expected_pipeline,
+                StreamState::Failed,
+                Some("EOS restart failed".into()),
+            );
             return;
         }
-        self.emit(id, StreamState::Looping, None);
+        self.emit_if_current_state(id, expected_pipeline, StreamState::Looping, None);
     }
-    fn record_error(&self, id: &str, detail: String) {
+    fn record_error(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
         if let Ok(mut streams) = self.inner.lock()
             && let Some(managed) = streams.get_mut(id)
+            && managed.pipeline == *expected_pipeline
+            && managed.state != StreamState::Stopping
         {
             managed.state = StreamState::Failed;
         }
         tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
-        self.emit(id, StreamState::Failed, Some(detail));
+        self.emit_if_current_state(id, expected_pipeline, StreamState::Failed, Some(detail));
     }
     fn record_client_added(&self, id: &str, client: SrtClientAddress) {
         let _publication = match self.publication.lock() {
@@ -421,6 +555,31 @@ impl Supervisor {
         };
         let _ = self.events.send(event);
     }
+    fn emit_if_current_state(
+        &self,
+        id: &str,
+        pipeline: &gst::Pipeline,
+        state: StreamState,
+        detail: Option<String>,
+    ) {
+        let _publication = match self.publication.lock() {
+            Ok(publication) => publication,
+            Err(_) => return,
+        };
+        let event = {
+            let streams = match self.inner.lock() {
+                Ok(streams) => streams,
+                Err(_) => return,
+            };
+            streams.get(id).and_then(|managed| {
+                (managed.pipeline == *pipeline && managed.state == state)
+                    .then(|| event_from_managed(id, managed, state, detail))
+            })
+        };
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+    }
     fn emit(&self, id: &str, state: StreamState, detail: Option<String>) {
         let _publication = match self.publication.lock() {
             Ok(publication) => publication,
@@ -451,7 +610,11 @@ impl Supervisor {
 mod tests {
     use gio::prelude::*;
     use std::{
-        sync::{TryLockError, mpsc},
+        sync::{
+            Arc, TryLockError,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -619,6 +782,79 @@ mod tests {
         assert!(result.is_err());
         assert!(supervisor.states().is_empty());
         assert_eq!(pipeline_state, gst::State::Null);
+    }
+
+    #[test]
+    fn stopped_start_is_not_finalized_or_monitored() {
+        gst::init().unwrap();
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut events = supervisor.subscribe();
+
+        supervisor.stop("feed").unwrap();
+
+        let monitor_starts = Arc::new(AtomicUsize::new(0));
+        let observed_starts = monitor_starts.clone();
+        let error = supervisor
+            .finalize_start("feed", &pipeline, move |_, _, _| {
+                observed_starts.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no longer current"));
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(monitor_starts.load(Ordering::SeqCst), 0);
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(states, vec![StreamState::Stopping, StreamState::Stopped]);
+    }
+
+    #[test]
+    fn competing_start_cannot_replace_managed_pipeline() {
+        gst::init().unwrap();
+        let supervisor = supervisor_with_test_stream("feed");
+        let original = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        let competing = gst::Pipeline::new();
+        competing.set_state(gst::State::Ready).unwrap();
+
+        let error = supervisor
+            .register_start(
+                "feed".into(),
+                competing.clone(),
+                SrtListenerConfig::new(9001, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already managed"));
+        assert_eq!(competing.current_state(), gst::State::Null);
+        assert_eq!(supervisor.inner.lock().unwrap()["feed"].pipeline, original);
+    }
+
+    #[test]
+    fn monitor_bus_is_scoped_to_pipeline_identity() {
+        gst::init().unwrap();
+        let supervisor = supervisor_with_test_stream("feed");
+        let original = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        assert!(supervisor.monitor_bus("feed", &original).is_some());
+
+        let replacement = gst::Pipeline::new();
+        supervisor.inner.lock().unwrap().insert(
+            "feed".into(),
+            ManagedStream {
+                pipeline: replacement.clone(),
+                state: StreamState::WaitingForCaller,
+                restarts: 0,
+                config: SrtListenerConfig::new(9001, 120).unwrap(),
+                mode: ProcessingMode::RemuxCopy,
+                clients: Vec::new(),
+            },
+        );
+
+        assert!(supervisor.monitor_bus("feed", &original).is_none());
+        assert!(supervisor.monitor_bus("feed", &replacement).is_some());
     }
 
     #[test]
