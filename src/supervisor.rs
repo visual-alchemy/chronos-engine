@@ -136,34 +136,70 @@ impl Supervisor {
         config: SrtListenerConfig,
         mode: ProcessingMode,
     ) -> Result<()> {
-        self.emit(&id, StreamState::Starting, None);
-        self.attach_srt_client_handlers(&id, &pipeline)?;
+        self.start_with(
+            id,
+            pipeline,
+            config,
+            mode,
+            || {},
+            |pipeline| {
+                pipeline.set_state(gst::State::Playing)?;
+                Ok(())
+            },
+            |supervisor, id, pipeline| {
+                // Re-acquire the bus after each restart so monitoring survives
+                // NULL → PLAYING cycles.
+                std::thread::spawn(move || supervisor.monitor_loop(&id, &pipeline));
+            },
+        )
+    }
+
+    fn start_with<A, P, M>(
+        &self,
+        id: String,
+        pipeline: gst::Pipeline,
+        config: SrtListenerConfig,
+        mode: ProcessingMode,
+        after_starting: A,
+        set_playing: P,
+        start_monitor: M,
+    ) -> Result<()>
+    where
+        A: FnOnce(),
+        P: FnOnce(&gst::Pipeline) -> Result<()>,
+        M: FnOnce(Supervisor, String, gst::Pipeline),
+    {
         self.register_start(id.clone(), pipeline.clone(), config, mode)?;
-        if let Err(error) = pipeline.set_state(gst::State::Playing) {
-            {
-                let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                // A concurrent start may have replaced this entry already.
-                if streams
-                    .get(&id)
-                    .is_some_and(|managed| managed.pipeline == pipeline)
-                {
-                    streams.remove(&id);
-                }
+        after_starting();
+        if let Err(error) = self.attach_srt_client_handlers(&id, &pipeline) {
+            if self.rollback_start(&id, &pipeline, StreamState::Starting) {
+                self.set_stale_pipeline_null(&id, &pipeline);
             }
-            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
-                tracing::warn!(
-                    stream_id = id,
-                    ?cleanup_error,
-                    "Failed to stop unsuccessful pipeline"
-                );
-            }
-            return Err(error.into());
+            return Err(error);
         }
-        self.finalize_start(&id, &pipeline, |supervisor, id, pipeline| {
-            // Re-acquire the bus after each restart so monitoring survives
-            // NULL → PLAYING cycles.
-            std::thread::spawn(move || supervisor.monitor_loop(&id, &pipeline));
-        })
+        if !self.prepare_start_for_playback(&id, &pipeline) {
+            let stop_owns_pipeline = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|streams| {
+                    streams.get(&id).map(|managed| {
+                        managed.pipeline == pipeline && managed.state == StreamState::Stopping
+                    })
+                })
+                .unwrap_or(false);
+            if !stop_owns_pipeline {
+                self.set_stale_pipeline_null(&id, &pipeline);
+            }
+            anyhow::bail!("Stream {id} start is no longer current")
+        }
+        if let Err(error) = set_playing(&pipeline) {
+            if self.rollback_start(&id, &pipeline, StreamState::WaitingForCaller) {
+                self.set_stale_pipeline_null(&id, &pipeline);
+            }
+            return Err(error);
+        }
+        self.finalize_start(&id, &pipeline, start_monitor)
     }
 
     fn register_start(
@@ -174,6 +210,10 @@ impl Supervisor {
         mode: ProcessingMode,
     ) -> Result<()> {
         let registered = {
+            let _publication = self
+                .publication
+                .lock()
+                .expect("supervisor publication mutex poisoned");
             let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
             if streams.contains_key(&id) {
                 false
@@ -182,13 +222,16 @@ impl Supervisor {
                     id.clone(),
                     ManagedStream {
                         pipeline: pipeline.clone(),
-                        state: StreamState::WaitingForCaller,
+                        state: StreamState::Starting,
                         restarts: 0,
                         config,
                         mode,
                         clients: Vec::new(),
                     },
                 );
+                let managed = streams.get(&id).expect("newly registered stream missing");
+                let event = event_from_managed(&id, managed, StreamState::Starting, None);
+                let _ = self.events.send(event);
                 true
             }
         };
@@ -204,6 +247,58 @@ impl Supervisor {
             );
         }
         anyhow::bail!("Stream {id} is already managed")
+    }
+
+    fn prepare_start_for_playback(&self, id: &str, pipeline: &gst::Pipeline) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("supervisor publication mutex poisoned");
+        let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+        let Some(managed) = streams.get_mut(id) else {
+            return false;
+        };
+        if managed.pipeline != *pipeline || managed.state != StreamState::Starting {
+            return false;
+        }
+        managed.state = StreamState::WaitingForCaller;
+        true
+    }
+
+    fn rollback_start(
+        &self,
+        id: &str,
+        pipeline: &gst::Pipeline,
+        expected_state: StreamState,
+    ) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("supervisor publication mutex poisoned");
+        let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+        let Some(managed) = streams.get(id) else {
+            return true;
+        };
+        if managed.pipeline != *pipeline {
+            return true;
+        }
+        if managed.state == StreamState::Stopping {
+            return false;
+        }
+        if managed.state == expected_state {
+            streams.remove(id);
+        }
+        true
+    }
+
+    fn set_stale_pipeline_null(&self, id: &str, pipeline: &gst::Pipeline) {
+        if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+            tracing::warn!(
+                stream_id = id,
+                ?cleanup_error,
+                "Failed to stop stale pipeline"
+            );
+        }
     }
 
     fn finalize_start<F>(&self, id: &str, pipeline: &gst::Pipeline, start_monitor: F) -> Result<()>
@@ -305,7 +400,11 @@ impl Supervisor {
         let is_current = {
             let streams = self.inner.lock().ok()?;
             let managed = streams.get(id)?;
-            managed.pipeline == *pipeline && managed.state != StreamState::Stopping
+            managed.pipeline == *pipeline
+                && matches!(
+                    managed.state,
+                    StreamState::WaitingForCaller | StreamState::Running | StreamState::Looping
+                )
         };
         is_current.then(|| pipeline.bus()).flatten()
     }
@@ -456,9 +555,15 @@ impl Supervisor {
                     is_current
                         .then(|| streams.remove(id))
                         .flatten()
-                        .map(|mut managed| {
-                            managed.clients.clear();
-                            event_from_managed(id, &managed, StreamState::Stopped, None)
+                        .map(|_| StreamEvent {
+                            stream_id: id.into(),
+                            state: StreamState::Stopped,
+                            detail: None,
+                            port: None,
+                            latency_ms: None,
+                            mode: None,
+                            loop_count: None,
+                            clients: Vec::new(),
                         })
                 };
                 if let Some(event) = event {
@@ -528,7 +633,9 @@ impl Supervisor {
             let Some(managed) = streams.get_mut(id) else {
                 return;
             };
-            if managed.pipeline != *expected_pipeline || managed.state == StreamState::Stopping {
+            if managed.pipeline != *expected_pipeline
+                || !matches!(managed.state, StreamState::Running | StreamState::Looping)
+            {
                 return;
             }
             managed.restarts = managed.restarts.saturating_add(1);
@@ -699,6 +806,7 @@ impl Supervisor {
             let _ = self.events.send(event);
         }
     }
+    #[cfg(test)]
     fn emit(&self, id: &str, state: StreamState, detail: Option<String>) {
         let _publication = match self.publication.lock() {
             Ok(publication) => publication,
@@ -730,7 +838,7 @@ mod tests {
     use gio::prelude::*;
     use std::{
         sync::{
-            Arc, TryLockError,
+            Arc, Mutex, TryLockError,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -904,6 +1012,125 @@ mod tests {
     }
 
     #[test]
+    fn stop_after_starting_cancels_before_playback() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add(&gst::ElementFactory::make("srtsink").build().unwrap())
+            .unwrap();
+        let mut events = supervisor.subscribe();
+        let stopping_supervisor = supervisor.clone();
+        let playing_calls = Arc::new(AtomicUsize::new(0));
+        let observed_playing = playing_calls.clone();
+        let monitor_starts = Arc::new(AtomicUsize::new(0));
+        let observed_monitors = monitor_starts.clone();
+
+        let error = supervisor
+            .start_with(
+                "feed".into(),
+                pipeline.clone(),
+                SrtListenerConfig::new(9000, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+                move || stopping_supervisor.stop("feed").unwrap(),
+                move |_| {
+                    observed_playing.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                move |_, _, _| {
+                    observed_monitors.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no longer current"));
+        assert_eq!(playing_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(monitor_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert!(supervisor.states().is_empty());
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                StreamState::Starting,
+                StreamState::Stopping,
+                StreamState::Stopped
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_failure_does_not_steal_entry_from_stop() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add(&gst::ElementFactory::make("srtsink").build().unwrap())
+            .unwrap();
+        let mut events = supervisor.subscribe();
+        let (stop_entered_tx, stop_entered_rx) = mpsc::channel();
+        let (release_stop_tx, release_stop_rx) = mpsc::channel();
+        let stop_supervisor = supervisor.clone();
+        let stop_thread = Arc::new(Mutex::new(None));
+        let recorded_stop_thread = stop_thread.clone();
+        let monitor_starts = Arc::new(AtomicUsize::new(0));
+        let observed_monitors = monitor_starts.clone();
+
+        let error = supervisor
+            .start_with(
+                "feed".into(),
+                pipeline.clone(),
+                SrtListenerConfig::new(9000, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+                || {},
+                move |_| {
+                    let handle = thread::spawn(move || {
+                        stop_supervisor.stop_with("feed", |_| {
+                            stop_entered_tx.send(()).unwrap();
+                            release_stop_rx.recv().unwrap();
+                            Ok(())
+                        })
+                    });
+                    *recorded_stop_thread.lock().unwrap() = Some(handle);
+                    stop_entered_rx.recv().unwrap();
+                    anyhow::bail!("injected Playing failure")
+                },
+                move |_, _, _| {
+                    observed_monitors.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected Playing failure"));
+        assert_eq!(supervisor.states()[0].state, StreamState::Stopping);
+        assert_eq!(monitor_starts.load(Ordering::SeqCst), 0);
+        release_stop_tx.send(()).unwrap();
+        stop_thread
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(supervisor.states().is_empty());
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                StreamState::Starting,
+                StreamState::Stopping,
+                StreamState::Stopped
+            ]
+        );
+    }
+
+    #[test]
     fn stopped_start_is_not_finalized_or_monitored() {
         gst::init().unwrap();
         let supervisor = supervisor_with_test_stream("feed");
@@ -949,6 +1176,10 @@ mod tests {
         assert_eq!(stopping.clients.len(), 1);
         let stopped = events.try_recv().unwrap();
         assert_eq!(stopped.state, StreamState::Stopped);
+        assert_eq!(stopped.port, None);
+        assert_eq!(stopped.latency_ms, None);
+        assert_eq!(stopped.mode, None);
+        assert_eq!(stopped.loop_count, None);
         assert!(stopped.clients.is_empty());
     }
 
@@ -1085,6 +1316,41 @@ mod tests {
         let failed = events.try_recv().unwrap();
         assert_eq!(failed.state, StreamState::Failed);
         assert!(failed.detail.unwrap().contains("injected Null failure"));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn failed_stream_cannot_be_resurrected_by_eos() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        supervisor
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut("feed")
+            .unwrap()
+            .state = StreamState::Failed;
+        let mut events = supervisor.subscribe();
+        let transitions = Arc::new(AtomicUsize::new(0));
+        let null_transitions = transitions.clone();
+        let playing_transitions = transitions.clone();
+
+        supervisor.record_eos_with(
+            "feed",
+            &pipeline,
+            move |_| {
+                null_transitions.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            move |_| {
+                playing_transitions.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(transitions.load(Ordering::SeqCst), 0);
+        assert_eq!(supervisor.states()[0].state, StreamState::Failed);
+        assert!(supervisor.monitor_bus("feed", &pipeline).is_none());
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 
