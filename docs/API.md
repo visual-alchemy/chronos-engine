@@ -60,6 +60,6 @@ Ports are constrained to `9000`–`9099` and cannot be allocated twice. `GET /ap
 }
 ```
 
-`clients` contains only currently connected callers known to this process. It becomes `[]` after a caller disconnects and is cleared when a stream is stopped or restarted. Client history, connection timestamps, and persistence are not provided.
+`clients` contains only currently connected callers known to this process. A disconnected caller is removed, and the list becomes `[]` after the last tracked caller disconnects. A successful stop clears the list, and a newly created or recreated stream starts with an empty list. Client history, connection timestamps, and persistence are not provided.
 
 `POST /api/streams/{id}/stop` stops the pipeline and releases its port. `GET /api/events` upgrades to a WebSocket that emits stream-state JSON. `GET /metrics` exports Prometheus text metrics.
