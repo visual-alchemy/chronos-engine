@@ -7,9 +7,15 @@ services:
       - "8080:8080/tcp"
       - "9000-9099:9000-9099/udp"
     volumes:
-      - /srv/chronos/media:/media:ro
+      - ./media:/media:ro
       - ./config:/app/config:ro
+      - chronos-data:/data
     environment:
       MEDIA_ROOT: /media
       BIND_ADDR: 0.0.0.0:8080
+      DATABASE_PATH: /data/chronos.db
       RUST_LOG: chronos_engine=info,tower_http=info
+      GST_DEBUG: "3"
+
+volumes:
+  chronos-data:
