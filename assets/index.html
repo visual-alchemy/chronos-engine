@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CHRONOS · SRT Playout Engine</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <!-- Ambient background glow -->
+  <div class="ambient-glow" aria-hidden="true"></div>
+
+  <header class="app-header">
+    <div class="header-container">
+      <div class="brand">
+        <div class="brand-symbol">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <polygon points="10 8 16 12 10 16 10 8" fill="currentColor"></polygon>
+          </svg>
+          <span class="live-pulse"></span>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title-wrap">
+            <h1 class="brand-name">CHRONOS</h1>
+            <span class="version-tag">ENGINE v0.1</span>
+          </div>
+          <span class="brand-desc">Cyclic Remuxing & SRT Playout Daemon</span>
+        </div>
+      </div>
+
+      <div class="header-status">
+        <div class="status-indicator">
+          <span class="status-dot" id="health-dot"></span>
+          <span class="status-label">ENGINE:</span>
+          <strong id="health" class="status-val">CONNECTING</strong>
+        </div>
+        <a href="/metrics" target="_blank" class="nav-btn" title="View Prometheus Metrics">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 3v18h18M7 16l4-4 4 4 5-6"></path>
+          </svg>
+          Metrics
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <div class="srt-explainer">
+    <div class="explainer-inner">
+      <div class="diagram-node">
+        <div class="node-badge">SERVER</div>
+        <div class="node-title">CHRONOS Engine</div>
+        <div class="node-sub">SRT <b>Listener</b> · UDP 9000–9099</div>
+      </div>
+      <div class="diagram-arrow">
+        <span class="protocol-tag">MPEG-TS over SRT (Copy-First)</span>
+        <div class="arrow-line"></div>
+      </div>
+      <div class="diagram-node">
+        <div class="node-badge player">CLIENT</div>
+        <div class="node-title">VLC / FFplay / OBS</div>
+        <div class="node-sub">SRT <b>Caller</b> (Local or LAN)</div>
+      </div>
+    </div>
+  </div>
+
+  <main class="dashboard-layout">
+    <!-- Left Column: Media Catalog & Stream Launcher -->
+    <section class="main-column">
+      <div class="panel library-panel">
+        <div class="panel-header">
+          <div>
+            <div class="eyebrow">STEP 1 · LOCAL ASSET CATALOG</div>
+            <h2 class="panel-title">Media Library & Output Config</h2>
+          </div>
+          <button id="refresh" class="btn btn-secondary">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+            </svg>
+            Refresh Catalog
+          </button>
+        </div>
+
+        <p id="media-summary" class="summary-text">Scanning media directory...</p>
+
+        <div id="media" class="cards-list"></div>
+      </div>
+    </section>
+
+    <!-- Right Column: Active Streams & WebSocket Telemetry -->
+    <aside class="sidebar-column">
+      <!-- Active Outputs -->
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="eyebrow">MONITORING</div>
+            <h2 class="panel-title">Active outputs</h2>
+          </div>
+          <span id="active-stream-count" class="badge">0 Active</span>
+        </div>
+        <div id="streams" class="streams-list">
+          <div class="empty-state">No active listeners. Create one from the media panel.</div>
+        </div>
+      </section>
+
+      <!-- Live Telemetry / Event Log -->
+      <section class="panel events-panel">
+        <div class="panel-header">
+          <div>
+            <div class="eyebrow">REALTIME BUS</div>
+            <h2 class="panel-title">Telemetry & Events</h2>
+          </div>
+          <div class="pulse-feed">
+            <span class="pulse-dot"></span>
+            LIVE
+          </div>
+        </div>
+        <div class="console-wrapper">
+          <ol id="events" class="console-log">
+            <li class="muted">Awaiting pipeline events...</li>
+          </ol>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <!-- Template: Media Card -->
+  <template id="media-card">
+    <article class="media-card">
+      <div class="card-inner">
+        <div class="media-card-top">
+          <div class="file-info">
+            <div class="file-icon">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+                <polyline points="10 9 9 9 8 9"></polyline>
+              </svg>
+            </div>
+            <div>
+              <strong class="name">video.mp4</strong>
+              <div class="meta-row">
+                <span class="meta">path · size</span>
+                <span class="probe-badge">PENDING</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="steps-grid">
+          <!-- Step A: Probe & Profile -->
+          <div class="step-card">
+            <div class="step-heading">
+              <span class="step-number">2</span>
+              <span>Profile & Inspection</span>
+            </div>
+            <label class="control-group">
+              <span class="label-text">Target Profile</span>
+              <select class="profile select-input">
+                <option value="srt-ts-universal">Universal SRT (H.264 / AAC / MPEG-TS)</option>
+                <option value="srt-ts-hevc">HEVC SRT (H.265 / AAC / MPEG-TS)</option>
+              </select>
+            </label>
+            <div class="action-buttons">
+              <button class="probe btn btn-secondary">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                Probe media
+              </button>
+              <button class="plan btn btn-secondary" disabled>
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+                  <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+                </svg>
+                Check compatibility
+              </button>
+            </div>
+          </div>
+
+          <!-- Step B: Port & Start Playout -->
+          <div class="step-card">
+            <div class="step-heading">
+              <span class="step-number">3</span>
+              <span>SRT Playout Listener</span>
+            </div>
+            <div class="port-config-row">
+              <label class="control-group port-group">
+                <span class="label-text">Listener Port</span>
+                <input class="port text-input" type="number" min="9000" max="9099" value="9000">
+              </label>
+              <div class="port-hint">UDP 9000–9099</div>
+            </div>
+            <button class="start btn btn-primary" disabled>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              Start listener
+            </button>
+          </div>
+        </div>
+
+        <div class="result" hidden></div>
+      </div>
+    </article>
+  </template>
+
+  <!-- Template: Stream Card -->
+  <template id="stream-card">
+    <article class="stream-card">
+      <div class="card-inner">
+        <div class="stream-head">
+          <div class="stream-header-left">
+            <span class="stream-pulse-dot"></span>
+            <div>
+              <strong class="stream-id">stream-id</strong>
+              <div class="stream-state-wrap">
+                <span class="stream-state badge">RUNNING</span>
+                <span class="stream-mode-badge badge">Direct copy</span>
+              </div>
+            </div>
+          </div>
+          <div class="stream-header-right">
+            <div class="loop-counter" hidden>
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+              <span class="loop-count">0</span> loops
+            </div>
+            <button class="stop btn btn-danger">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              </svg>
+              Stop
+            </button>
+          </div>
+        </div>
+
+        <p class="role-line">CHRONOS listens. VLC calls this listener.</p>
+        <p class="role-line stream-clients">No client connected</p>
+
+        <div class="stream-urls">
+          <div class="url-input-block">
+            <div class="url-label-row">
+              <span class="url-label">VLC on this Mac (Localhost)</span>
+              <button class="copy-local btn btn-xs btn-secondary">Copy local URL</button>
+            </div>
+            <input class="local-url text-input code-font" readonly>
+          </div>
+
+          <div class="url-input-block">
+            <div class="url-label-row">
+              <span class="url-label">VLC on another device (LAN)</span>
+              <button class="copy-lan btn btn-xs btn-secondary">Copy LAN URL</button>
+            </div>
+            <div class="lan-inputs">
+              <input class="lan-host text-input" placeholder="Mac LAN IP, e.g. 192.168.1.28">
+              <input class="lan-url text-input code-font" readonly placeholder="Fill LAN IP above">
+            </div>
+          </div>
+        </div>
+
+        <div class="stream-vlc-tip">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="16" x2="12" y2="12"></line>
+            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+          </svg>
+          <span>In VLC: <b>File / Media</b> → <b>Open Network Stream...</b> → Paste URL</span>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
