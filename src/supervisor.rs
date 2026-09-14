@@ -78,7 +78,7 @@ fn event_from_pending(
 fn socket_address_to_client(address: &gio::SocketAddress) -> Option<SrtClientAddress> {
     let address = address.clone().downcast::<gio::InetSocketAddress>().ok()?;
     Some(SrtClientAddress {
-        ip: address.address().to_string().into(),
+        ip: address.address().to_string(),
         port: address.port(),
     })
 }
@@ -180,6 +180,9 @@ impl Supervisor {
         )
     }
 
+    // Keep the private hook seam explicit for lifecycle race tests; bundling
+    // these injected callbacks would make those tests harder to read.
+    #[allow(clippy::too_many_arguments)]
     fn start_with<A, P, M>(
         &self,
         id: String,
@@ -417,14 +420,14 @@ impl Supervisor {
         };
 
         if !finalized {
-            if !self.stop_owns_pipeline(id, pipeline) {
-                if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
-                    tracing::warn!(
-                        stream_id = id,
-                        ?cleanup_error,
-                        "Failed to stop stale pipeline"
-                    );
-                }
+            if !self.stop_owns_pipeline(id, pipeline)
+                && let Err(cleanup_error) = pipeline.set_state(gst::State::Null)
+            {
+                tracing::warn!(
+                    stream_id = id,
+                    ?cleanup_error,
+                    "Failed to stop stale pipeline"
+                );
             }
             anyhow::bail!("Stream {id} start is no longer current")
         }
@@ -463,12 +466,8 @@ impl Supervisor {
                     );
                     return None;
                 };
-                let Some(inner) = inner.upgrade() else {
-                    return None;
-                };
-                let Some(pending_starts) = pending_starts.upgrade() else {
-                    return None;
-                };
+                let inner = inner.upgrade()?;
+                let pending_starts = pending_starts.upgrade()?;
                 let supervisor = Supervisor {
                     inner,
                     pending_starts,
@@ -868,14 +867,12 @@ impl Supervisor {
                 false
             }
         };
-        if !restarted {
-            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
-                tracing::warn!(
-                    stream_id = id,
-                    ?cleanup_error,
-                    "EOS: failed to stop stale pipeline"
-                );
-            }
+        if !restarted && let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+            tracing::warn!(
+                stream_id = id,
+                ?cleanup_error,
+                "EOS: failed to stop stale pipeline"
+            );
         }
     }
 
