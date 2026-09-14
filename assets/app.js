@@ -326,14 +326,14 @@ async function loadStreams() {
         pulseDot.style.background = 'var(--amber)';
         pulseDot.style.boxShadow = '0 0 10px var(--amber)';
         stateBadge.style.background = 'rgba(245, 158, 11, 0.15)';
-        stateBadge.style.color = '#fcd34d';
+        stateBadge.style.color = '#fbbf24';
         stateBadge.style.borderColor = 'rgba(245, 158, 11, 0.3)';
       } else if (stream.state === 'failed') {
         pulseDot.style.background = 'var(--rose)';
         pulseDot.style.boxShadow = '0 0 10px var(--rose)';
-        stateBadge.style.background = 'rgba(244, 63, 94, 0.15)';
-        stateBadge.style.color = '#fda4af';
-        stateBadge.style.borderColor = 'rgba(244, 63, 94, 0.3)';
+        stateBadge.style.background = 'rgba(255, 42, 42, 0.15)';
+        stateBadge.style.color = '#ff6b6b';
+        stateBadge.style.borderColor = 'rgba(255, 42, 42, 0.3)';
       }
 
       const loopCounter = card.querySelector('.loop-counter');
