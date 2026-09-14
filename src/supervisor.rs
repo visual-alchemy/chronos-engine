@@ -19,8 +19,15 @@ use crate::{
 #[derive(Clone)]
 pub struct Supervisor {
     inner: Arc<Mutex<HashMap<String, ManagedStream>>>,
+    pending_starts: Arc<Mutex<HashMap<String, PendingStart>>>,
     publication: Arc<Mutex<()>>,
     events: broadcast::Sender<StreamEvent>,
+}
+struct PendingStart {
+    pipeline: gst::Pipeline,
+    config: SrtListenerConfig,
+    mode: ProcessingMode,
+    canceled: bool,
 }
 struct ManagedStream {
     pipeline: gst::Pipeline,
@@ -50,6 +57,24 @@ fn event_from_managed(
     }
 }
 
+fn event_from_pending(
+    id: &str,
+    pending: &PendingStart,
+    state: StreamState,
+    detail: Option<String>,
+) -> StreamEvent {
+    StreamEvent {
+        stream_id: id.into(),
+        state,
+        detail,
+        port: Some(pending.config.port),
+        latency_ms: Some(pending.config.latency_ms),
+        mode: Some(pending.mode.clone()),
+        loop_count: Some(0),
+        clients: Vec::new(),
+    }
+}
+
 fn socket_address_to_client(address: &gio::SocketAddress) -> Option<SrtClientAddress> {
     let address = address.clone().downcast::<gio::InetSocketAddress>().ok()?;
     Some(SrtClientAddress {
@@ -75,6 +100,7 @@ impl Supervisor {
         let (events, _) = broadcast::channel(128);
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            pending_starts: Arc::new(Mutex::new(HashMap::new())),
             publication: Arc::new(Mutex::new(())),
             events,
         }
@@ -178,17 +204,7 @@ impl Supervisor {
             return Err(error);
         }
         if !self.prepare_start_for_playback(&id, &pipeline) {
-            let stop_owns_pipeline = self
-                .inner
-                .lock()
-                .ok()
-                .and_then(|streams| {
-                    streams.get(&id).map(|managed| {
-                        managed.pipeline == pipeline && managed.state == StreamState::Stopping
-                    })
-                })
-                .unwrap_or(false);
-            if !stop_owns_pipeline {
+            if !self.stop_owns_pipeline(&id, &pipeline) {
                 self.set_stale_pipeline_null(&id, &pipeline);
             }
             anyhow::bail!("Stream {id} start is no longer current")
@@ -214,25 +230,38 @@ impl Supervisor {
                 .publication
                 .lock()
                 .expect("supervisor publication mutex poisoned");
-            let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-            if streams.contains_key(&id) {
-                false
-            } else {
-                streams.insert(
-                    id.clone(),
-                    ManagedStream {
-                        pipeline: pipeline.clone(),
-                        state: StreamState::Starting,
-                        restarts: 0,
-                        config,
-                        mode,
-                        clients: Vec::new(),
-                    },
-                );
-                let managed = streams.get(&id).expect("newly registered stream missing");
-                let event = event_from_managed(&id, managed, StreamState::Starting, None);
+            let event = {
+                let mut pending = self
+                    .pending_starts
+                    .lock()
+                    .expect("pending starts mutex poisoned");
+                let streams = self.inner.lock().expect("supervisor mutex poisoned");
+                if pending.contains_key(&id) || streams.contains_key(&id) {
+                    None
+                } else {
+                    pending.insert(
+                        id.clone(),
+                        PendingStart {
+                            pipeline: pipeline.clone(),
+                            config,
+                            mode,
+                            canceled: false,
+                        },
+                    );
+                    let pending_start = pending.get(&id).expect("newly registered start missing");
+                    Some(event_from_pending(
+                        &id,
+                        pending_start,
+                        StreamState::Starting,
+                        None,
+                    ))
+                }
+            };
+            if let Some(event) = event {
                 let _ = self.events.send(event);
                 true
+            } else {
+                false
             }
         };
         if registered {
@@ -254,14 +283,29 @@ impl Supervisor {
             .publication
             .lock()
             .expect("supervisor publication mutex poisoned");
+        let mut pending = self
+            .pending_starts
+            .lock()
+            .expect("pending starts mutex poisoned");
         let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-        let Some(managed) = streams.get_mut(id) else {
+        let Some(pending_start) = pending.get(id) else {
             return false;
         };
-        if managed.pipeline != *pipeline || managed.state != StreamState::Starting {
+        if pending_start.pipeline != *pipeline || pending_start.canceled {
             return false;
         }
-        managed.state = StreamState::WaitingForCaller;
+        let pending_start = pending.remove(id).expect("pending start disappeared");
+        streams.insert(
+            id.to_owned(),
+            ManagedStream {
+                pipeline: pending_start.pipeline,
+                state: StreamState::WaitingForCaller,
+                restarts: 0,
+                config: pending_start.config,
+                mode: pending_start.mode,
+                clients: Vec::new(),
+            },
+        );
         true
     }
 
@@ -275,6 +319,20 @@ impl Supervisor {
             .publication
             .lock()
             .expect("supervisor publication mutex poisoned");
+        let mut pending = self
+            .pending_starts
+            .lock()
+            .expect("pending starts mutex poisoned");
+        if let Some(pending_start) = pending.get(id) {
+            if pending_start.pipeline != *pipeline {
+                return true;
+            }
+            if pending_start.canceled {
+                return false;
+            }
+            pending.remove(id);
+            return true;
+        }
         let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
         let Some(managed) = streams.get(id) else {
             return true;
@@ -282,13 +340,26 @@ impl Supervisor {
         if managed.pipeline != *pipeline {
             return true;
         }
-        if managed.state == StreamState::Stopping {
+        if matches!(managed.state, StreamState::Stopping | StreamState::Failed) {
             return false;
         }
         if managed.state == expected_state {
             streams.remove(id);
         }
         true
+    }
+
+    fn stop_owns_pipeline(&self, id: &str, pipeline: &gst::Pipeline) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|streams| {
+                streams.get(id).map(|managed| {
+                    managed.pipeline == *pipeline
+                        && matches!(managed.state, StreamState::Stopping | StreamState::Failed)
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn set_stale_pipeline_null(&self, id: &str, pipeline: &gst::Pipeline) {
@@ -329,12 +400,14 @@ impl Supervisor {
         };
 
         if !finalized {
-            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
-                tracing::warn!(
-                    stream_id = id,
-                    ?cleanup_error,
-                    "Failed to stop stale pipeline"
-                );
+            if !self.stop_owns_pipeline(id, pipeline) {
+                if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+                    tracing::warn!(
+                        stream_id = id,
+                        ?cleanup_error,
+                        "Failed to stop stale pipeline"
+                    );
+                }
             }
             anyhow::bail!("Stream {id} start is no longer current")
         }
@@ -350,6 +423,7 @@ impl Supervisor {
             let id = id.to_owned();
             // Avoid an ownership cycle: inner -> pipeline -> sink -> callback -> inner.
             let inner = Arc::downgrade(&self.inner);
+            let pending_starts = Arc::downgrade(&self.pending_starts);
             let publication = self.publication.clone();
             let events = self.events.clone();
             sink.connect(signal, false, move |values| {
@@ -375,8 +449,12 @@ impl Supervisor {
                 let Some(inner) = inner.upgrade() else {
                     return None;
                 };
+                let Some(pending_starts) = pending_starts.upgrade() else {
+                    return None;
+                };
                 let supervisor = Supervisor {
                     inner,
+                    pending_starts,
                     publication: publication.clone(),
                     events: events.clone(),
                 };
@@ -490,18 +568,35 @@ impl Supervisor {
     where
         F: FnOnce(&gst::Pipeline) -> Result<()>,
     {
-        let pipeline = {
+        enum StopTarget {
+            Pending,
+            Managed,
+        }
+
+        let target = {
             let _publication = self
                 .publication
                 .lock()
                 .expect("supervisor publication mutex poisoned");
-            let (event, pipeline) = {
+            let (event, target) = {
+                let mut pending = self
+                    .pending_starts
+                    .lock()
+                    .expect("pending starts mutex poisoned");
                 let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                if let Some(managed) = streams.get_mut(id) {
+                let (event, pipeline, target) = if let Some(pending_start) = pending.get_mut(id) {
+                    pending_start.canceled = true;
+                    (
+                        event_from_pending(id, pending_start, StreamState::Stopping, None),
+                        Some(pending_start.pipeline.clone()),
+                        Some(StopTarget::Pending),
+                    )
+                } else if let Some(managed) = streams.get_mut(id) {
                     managed.state = StreamState::Stopping;
                     (
                         event_from_managed(id, managed, StreamState::Stopping, None),
                         Some(managed.pipeline.clone()),
+                        Some(StopTarget::Managed),
                     )
                 } else {
                     (
@@ -516,14 +611,19 @@ impl Supervisor {
                             clients: Vec::new(),
                         },
                         None,
+                        None,
                     )
-                }
+                };
+                (
+                    event,
+                    target.map(|target| (target, pipeline.expect("stop target pipeline missing"))),
+                )
             };
             let _ = self.events.send(event);
-            pipeline
+            target
         };
 
-        let Some(pipeline) = pipeline else {
+        let Some((target, pipeline)) = target else {
             let _publication = self
                 .publication
                 .lock()
@@ -547,27 +647,38 @@ impl Supervisor {
                     .publication
                     .lock()
                     .expect("supervisor publication mutex poisoned");
-                let event = {
+                let removed = {
+                    let mut pending = self
+                        .pending_starts
+                        .lock()
+                        .expect("pending starts mutex poisoned");
                     let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                    let is_current = streams
-                        .get(id)
-                        .is_some_and(|managed| managed.pipeline == pipeline);
-                    is_current
-                        .then(|| streams.remove(id))
-                        .flatten()
-                        .map(|_| StreamEvent {
-                            stream_id: id.into(),
-                            state: StreamState::Stopped,
-                            detail: None,
-                            port: None,
-                            latency_ms: None,
-                            mode: None,
-                            loop_count: None,
-                            clients: Vec::new(),
-                        })
+                    match target {
+                        StopTarget::Pending => pending
+                            .get(id)
+                            .is_some_and(|pending_start| pending_start.pipeline == pipeline)
+                            .then(|| pending.remove(id))
+                            .flatten()
+                            .is_some(),
+                        StopTarget::Managed => streams
+                            .get(id)
+                            .is_some_and(|managed| managed.pipeline == pipeline)
+                            .then(|| streams.remove(id))
+                            .flatten()
+                            .is_some(),
+                    }
                 };
-                if let Some(event) = event {
-                    let _ = self.events.send(event);
+                if removed {
+                    let _ = self.events.send(StreamEvent {
+                        stream_id: id.into(),
+                        state: StreamState::Stopped,
+                        detail: None,
+                        port: None,
+                        latency_ms: None,
+                        mode: None,
+                        loop_count: None,
+                        clients: Vec::new(),
+                    });
                 }
                 Ok(())
             }
@@ -578,14 +689,57 @@ impl Supervisor {
                     .lock()
                     .expect("supervisor publication mutex poisoned");
                 let event = {
+                    let mut pending = self
+                        .pending_starts
+                        .lock()
+                        .expect("pending starts mutex poisoned");
                     let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                    streams.get_mut(id).and_then(|managed| {
-                        (managed.pipeline == pipeline && managed.state == StreamState::Stopping)
-                            .then(|| {
-                                managed.state = StreamState::Failed;
-                                event_from_managed(id, managed, StreamState::Failed, Some(detail))
-                            })
-                    })
+                    match target {
+                        StopTarget::Pending => {
+                            let is_current = pending
+                                .get(id)
+                                .is_some_and(|pending_start| pending_start.pipeline == pipeline);
+                            is_current
+                                .then(|| pending.remove(id))
+                                .flatten()
+                                .map(|pending_start| {
+                                    let event = StreamEvent {
+                                        stream_id: id.into(),
+                                        state: StreamState::Failed,
+                                        detail: Some(detail.clone()),
+                                        port: Some(pending_start.config.port),
+                                        latency_ms: Some(pending_start.config.latency_ms),
+                                        mode: Some(pending_start.mode.clone()),
+                                        loop_count: Some(0),
+                                        clients: Vec::new(),
+                                    };
+                                    streams.insert(
+                                        id.into(),
+                                        ManagedStream {
+                                            pipeline: pending_start.pipeline,
+                                            state: StreamState::Failed,
+                                            restarts: 0,
+                                            config: pending_start.config,
+                                            mode: pending_start.mode,
+                                            clients: Vec::new(),
+                                        },
+                                    );
+                                    event
+                                })
+                        }
+                        StopTarget::Managed => streams.get_mut(id).and_then(|managed| {
+                            (managed.pipeline == pipeline && managed.state == StreamState::Stopping)
+                                .then(|| {
+                                    managed.state = StreamState::Failed;
+                                    event_from_managed(
+                                        id,
+                                        managed,
+                                        StreamState::Failed,
+                                        Some(detail.clone()),
+                                    )
+                                })
+                        }),
+                    }
                 };
                 tracing::error!(stream_id = id, %error, "Failed to stop GStreamer pipeline");
                 if let Some(event) = event {
@@ -728,15 +882,28 @@ impl Supervisor {
         }
     }
     fn record_error(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
-        if let Ok(mut streams) = self.inner.lock()
-            && let Some(managed) = streams.get_mut(id)
-            && managed.pipeline == *expected_pipeline
-            && managed.state != StreamState::Stopping
-        {
-            managed.state = StreamState::Failed;
-        }
         tracing::error!(stream_id = id, %detail, "GStreamer pipeline failed");
-        self.emit_if_current_state(id, expected_pipeline, StreamState::Failed, Some(detail));
+        let transitioned = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut streams| {
+                streams.get_mut(id).map(|managed| {
+                    managed.pipeline == *expected_pipeline
+                        && matches!(
+                            managed.state,
+                            StreamState::WaitingForCaller
+                                | StreamState::Running
+                                | StreamState::Looping
+                        )
+                        .then(|| managed.state = StreamState::Failed)
+                        .is_some()
+                })
+            })
+            .unwrap_or(false);
+        if transitioned {
+            self.emit_if_current_state(id, expected_pipeline, StreamState::Failed, Some(detail));
+        }
     }
     fn record_client_added(&self, id: &str, client: SrtClientAddress) {
         let _publication = match self.publication.lock() {
@@ -1021,6 +1188,7 @@ mod tests {
             .unwrap();
         let mut events = supervisor.subscribe();
         let stopping_supervisor = supervisor.clone();
+        let pending_pipeline = pipeline.clone();
         let playing_calls = Arc::new(AtomicUsize::new(0));
         let observed_playing = playing_calls.clone();
         let monitor_starts = Arc::new(AtomicUsize::new(0));
@@ -1032,7 +1200,14 @@ mod tests {
                 pipeline.clone(),
                 SrtListenerConfig::new(9000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
-                move || stopping_supervisor.stop("feed").unwrap(),
+                move || {
+                    assert!(stopping_supervisor.inner.lock().unwrap().is_empty());
+                    assert_eq!(
+                        stopping_supervisor.pending_starts.lock().unwrap()["feed"].pipeline,
+                        pending_pipeline
+                    );
+                    stopping_supervisor.stop("feed").unwrap();
+                },
                 move |_| {
                     observed_playing.fetch_add(1, Ordering::SeqCst);
                     Ok(())
@@ -1048,6 +1223,7 @@ mod tests {
         assert_eq!(monitor_starts.load(Ordering::SeqCst), 0);
         assert_eq!(pipeline.current_state(), gst::State::Null);
         assert!(supervisor.states().is_empty());
+        assert!(supervisor.pending_starts.lock().unwrap().is_empty());
         let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
             .map(|event| event.state)
             .collect();
@@ -1131,6 +1307,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_stop_failure_retains_failed_pipeline_without_playback() {
+        gst::init().unwrap();
+        let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add(&gst::ElementFactory::make("srtsink").build().unwrap())
+            .unwrap();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut events = supervisor.subscribe();
+        let stop_supervisor = supervisor.clone();
+        let playing_calls = Arc::new(AtomicUsize::new(0));
+        let observed_playing = playing_calls.clone();
+
+        let error = supervisor
+            .start_with(
+                "feed".into(),
+                pipeline.clone(),
+                SrtListenerConfig::new(9000, 120).unwrap(),
+                ProcessingMode::RemuxCopy,
+                move || {
+                    stop_supervisor
+                        .stop_with("feed", |_| anyhow::bail!("injected Null failure"))
+                        .unwrap_err();
+                },
+                move |_| {
+                    observed_playing.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_, _, _| {},
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no longer current"));
+        assert_eq!(playing_calls.load(Ordering::SeqCst), 0);
+        assert!(supervisor.pending_starts.lock().unwrap().is_empty());
+        assert_eq!(pipeline.current_state(), gst::State::Ready);
+        assert_eq!(supervisor.states()[0].state, StreamState::Failed);
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                StreamState::Starting,
+                StreamState::Stopping,
+                StreamState::Failed
+            ]
+        );
+    }
+
+    #[test]
     fn stopped_start_is_not_finalized_or_monitored() {
         gst::init().unwrap();
         let supervisor = supervisor_with_test_stream("feed");
@@ -1181,6 +1408,30 @@ mod tests {
         assert_eq!(stopped.mode, None);
         assert_eq!(stopped.loop_count, None);
         assert!(stopped.clients.is_empty());
+    }
+
+    #[test]
+    fn late_error_does_not_republish_failed_or_stopping() {
+        gst::init().unwrap();
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        let mut events = supervisor.subscribe();
+
+        supervisor.record_error("feed", &pipeline, "first failure".into());
+        assert_eq!(events.try_recv().unwrap().state, StreamState::Failed);
+
+        supervisor.record_error("feed", &pipeline, "late failure".into());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        supervisor
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut("feed")
+            .unwrap()
+            .state = StreamState::Stopping;
+        supervisor.record_error("feed", &pipeline, "stop failure".into());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
