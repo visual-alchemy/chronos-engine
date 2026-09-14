@@ -444,6 +444,7 @@ impl Supervisor {
             // Avoid an ownership cycle: inner -> pipeline -> sink -> callback -> inner.
             let inner = Arc::downgrade(&self.inner);
             let pending_starts = Arc::downgrade(&self.pending_starts);
+            let pipeline = pipeline.downgrade();
             let publication = self.publication.clone();
             let events = self.events.clone();
             sink.connect(signal, false, move |values| {
@@ -474,10 +475,11 @@ impl Supervisor {
                     publication: publication.clone(),
                     events: events.clone(),
                 };
+                let pipeline = pipeline.upgrade()?;
                 if signal == "caller-added" {
-                    supervisor.record_client_added(&id, client);
+                    supervisor.record_client_added(&id, &pipeline, client);
                 } else {
-                    supervisor.record_client_removed(&id, &client);
+                    supervisor.record_client_removed(&id, &pipeline, &client);
                 }
                 None
             });
@@ -919,7 +921,12 @@ impl Supervisor {
             self.emit_if_current_state(id, expected_pipeline, StreamState::Failed, Some(detail));
         }
     }
-    fn record_client_added(&self, id: &str, client: SrtClientAddress) {
+    fn record_client_added(
+        &self,
+        id: &str,
+        expected_pipeline: &gst::Pipeline,
+        client: SrtClientAddress,
+    ) {
         let _publication = match self.publication.lock() {
             Ok(publication) => publication,
             Err(_) => return,
@@ -932,6 +939,9 @@ impl Supervisor {
             let Some(managed) = streams.get_mut(id) else {
                 return;
             };
+            if managed.pipeline != *expected_pipeline {
+                return;
+            }
             if managed.clients.contains(&client) {
                 return;
             }
@@ -940,7 +950,12 @@ impl Supervisor {
         };
         let _ = self.events.send(event);
     }
-    fn record_client_removed(&self, id: &str, client: &SrtClientAddress) {
+    fn record_client_removed(
+        &self,
+        id: &str,
+        expected_pipeline: &gst::Pipeline,
+        client: &SrtClientAddress,
+    ) {
         let _publication = match self.publication.lock() {
             Ok(publication) => publication,
             Err(_) => return,
@@ -953,6 +968,9 @@ impl Supervisor {
             let Some(managed) = streams.get_mut(id) else {
                 return;
             };
+            if managed.pipeline != *expected_pipeline {
+                return;
+            }
             let previous_len = managed.clients.len();
             managed.clients.retain(|existing| existing != client);
             if managed.clients.len() == previous_len {
@@ -1154,6 +1172,49 @@ mod tests {
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
         assert!(supervisor.states()[0].clients.is_empty());
         assert_eq!(pipeline.current_state(), gst::State::Null);
+    }
+
+    #[test]
+    fn caller_signals_from_replaced_pipeline_are_ignored() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let old_pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        let old_sink = gst::ElementFactory::make("srtsink").build().unwrap();
+        old_pipeline.add(&old_sink).unwrap();
+        supervisor
+            .attach_srt_client_handlers("feed", &old_pipeline)
+            .unwrap();
+
+        supervisor.stop("feed").unwrap();
+
+        let current_client = SrtClientAddress {
+            ip: "192.0.2.10".into(),
+            port: 54321,
+        };
+        supervisor.inner.lock().unwrap().insert(
+            "feed".into(),
+            ManagedStream {
+                pipeline: gst::Pipeline::new(),
+                state: StreamState::Running,
+                restarts: 0,
+                config: SrtListenerConfig::new(9000, 120).unwrap(),
+                mode: ProcessingMode::RemuxCopy,
+                clients: vec![current_client.clone()],
+            },
+        );
+        let mut events = supervisor.subscribe();
+
+        let stale_inet = gio::InetAddress::from_string("192.0.2.11").unwrap();
+        let stale_address: gio::SocketAddress =
+            gio::InetSocketAddress::new(&stale_inet, 54322).upcast();
+        old_sink.emit_by_name::<()>("caller-added", &[&1i32, &stale_address]);
+
+        let current_inet = gio::InetAddress::from_string(&current_client.ip).unwrap();
+        let current_address: gio::SocketAddress =
+            gio::InetSocketAddress::new(&current_inet, current_client.port).upcast();
+        old_sink.emit_by_name::<()>("caller-removed", &[&1i32, &current_address]);
+
+        assert_eq!(supervisor.states()[0].clients, vec![current_client]);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -1470,8 +1531,10 @@ mod tests {
     #[test]
     fn stopped_event_always_clears_clients() {
         let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
         supervisor.record_client_added(
             "feed",
+            &pipeline,
             SrtClientAddress {
                 ip: "192.0.2.10".into(),
                 port: 54321,
@@ -1523,6 +1586,7 @@ mod tests {
         let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
         supervisor.record_client_added(
             "feed",
+            &pipeline,
             SrtClientAddress {
                 ip: "192.0.2.10".into(),
                 port: 54321,
@@ -1696,6 +1760,7 @@ mod tests {
     #[test]
     fn tracks_unique_clients_and_removes_them() {
         let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
         let mut events = supervisor.subscribe();
         let client = SrtClientAddress {
             ip: "192.0.2.10".into(),
@@ -1706,45 +1771,47 @@ mod tests {
             port: 54322,
         };
 
-        supervisor.record_client_added("feed", client.clone());
+        supervisor.record_client_added("feed", &pipeline, client.clone());
         assert_eq!(events.try_recv().unwrap().clients, vec![client.clone()]);
 
-        supervisor.record_client_added("feed", client.clone());
+        supervisor.record_client_added("feed", &pipeline, client.clone());
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
         assert_eq!(supervisor.states()[0].clients, vec![client.clone()]);
 
-        supervisor.record_client_added("feed", other_client.clone());
+        supervisor.record_client_added("feed", &pipeline, other_client.clone());
         assert_eq!(
             events.try_recv().unwrap().clients,
             vec![client.clone(), other_client.clone()]
         );
 
-        supervisor.record_client_removed("feed", &client);
+        supervisor.record_client_removed("feed", &pipeline, &client);
         assert_eq!(
             events.try_recv().unwrap().clients,
             vec![other_client.clone()]
         );
         assert_eq!(supervisor.states()[0].clients, vec![other_client.clone()]);
 
-        supervisor.record_client_removed("feed", &client);
+        supervisor.record_client_removed("feed", &pipeline, &client);
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 
-        supervisor.record_client_removed("feed", &other_client);
+        supervisor.record_client_removed("feed", &pipeline, &other_client);
         assert!(events.try_recv().unwrap().clients.is_empty());
         assert!(supervisor.states()[0].clients.is_empty());
     }
 
     #[test]
     fn ignores_client_updates_for_unknown_streams() {
+        gst::init().unwrap();
         let supervisor = Supervisor::new();
+        let pipeline = gst::Pipeline::new();
         let mut events = supervisor.subscribe();
         let client = SrtClientAddress {
             ip: "192.0.2.10".into(),
             port: 54321,
         };
 
-        supervisor.record_client_added("missing", client.clone());
-        supervisor.record_client_removed("missing", &client);
+        supervisor.record_client_added("missing", &pipeline, client.clone());
+        supervisor.record_client_removed("missing", &pipeline, &client);
 
         assert!(supervisor.states().is_empty());
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
@@ -1753,6 +1820,7 @@ mod tests {
     #[test]
     fn publishes_concurrent_client_updates_in_mutation_order() {
         let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
         let mut events = supervisor.subscribe();
         let client = SrtClientAddress {
             ip: "192.0.2.10".into(),
@@ -1761,11 +1829,12 @@ mod tests {
 
         let inner_guard = supervisor.inner.lock().unwrap();
         let add_supervisor = supervisor.clone();
+        let add_pipeline = pipeline.clone();
         let add_client = client.clone();
         let (add_started_tx, add_started_rx) = mpsc::channel();
         let add = thread::spawn(move || {
             add_started_tx.send(()).unwrap();
-            add_supervisor.record_client_added("feed", add_client);
+            add_supervisor.record_client_added("feed", &add_pipeline, add_client);
         });
         add_started_rx.recv().unwrap();
 
@@ -1784,11 +1853,12 @@ mod tests {
         }
 
         let remove_supervisor = supervisor.clone();
+        let remove_pipeline = pipeline.clone();
         let remove_client = client.clone();
         let (remove_started_tx, remove_started_rx) = mpsc::channel();
         let remove = thread::spawn(move || {
             remove_started_tx.send(()).unwrap();
-            remove_supervisor.record_client_removed("feed", &remove_client);
+            remove_supervisor.record_client_removed("feed", &remove_pipeline, &remove_client);
         });
         remove_started_rx.recv().unwrap();
 
@@ -1805,11 +1875,12 @@ mod tests {
     #[test]
     fn emit_preserves_explicit_state_and_snapshots_managed_fields() {
         let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
         let client = SrtClientAddress {
             ip: "192.0.2.10".into(),
             port: 54321,
         };
-        supervisor.record_client_added("feed", client.clone());
+        supervisor.record_client_added("feed", &pipeline, client.clone());
         let mut events = supervisor.subscribe();
 
         supervisor.emit("feed", StreamState::Starting, Some("starting again".into()));
