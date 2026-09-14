@@ -53,21 +53,44 @@ function callerUrl(host, stream) {
   return `srt://${host}:${stream.port}?mode=caller&latency=${stream.latency_ms || 120}`;
 }
 
+function isValidIpv4(ip) {
+  const octets = ip.split('.');
+  return (
+    octets.length === 4 &&
+    octets.every(
+      (octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255,
+    )
+  );
+}
+
+function isValidIpv6(ip) {
+  if (!ip.includes(':')) return false;
+
+  try {
+    new URL(`http://[${ip}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidIpLiteral(ip) {
+  return isValidIpv4(ip) || isValidIpv6(ip);
+}
+
 function formatClientSummary(value) {
   const clients = Array.isArray(value) ? value : [];
   const addresses = clients.flatMap((client) => {
+    const ip = typeof client?.ip === 'string' ? client.ip.trim() : '';
     if (
-      !client ||
-      typeof client.ip !== 'string' ||
-      !client.ip.trim() ||
+      !isValidIpLiteral(ip) ||
       !Number.isInteger(client.port) ||
-      client.port < 0 ||
+      client.port < 1 ||
       client.port > 65535
     ) {
       return [];
     }
 
-    const ip = client.ip.trim();
     return [ip.includes(':') ? `[${ip}]:${client.port}` : `${ip}:${client.port}`];
   });
 
