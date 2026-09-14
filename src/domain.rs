@@ -151,7 +151,9 @@ pub enum ProcessingMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{probe_status_for_discoverer_result, ProcessingMode, ProbeStatus, StreamEvent, StreamState};
+    use super::{
+        ProbeStatus, ProcessingMode, StreamEvent, StreamState, probe_status_for_discoverer_result,
+    };
 
     #[test]
     fn stream_event_serializes_connected_clients() {
