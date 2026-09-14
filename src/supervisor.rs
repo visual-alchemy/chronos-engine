@@ -1068,7 +1068,7 @@ mod tests {
                     pipeline: gst::Pipeline::new(),
                     state: StreamState::Running,
                     restarts: 0,
-                    config: SrtListenerConfig::new(9000, 120).unwrap(),
+                    config: SrtListenerConfig::new(10000, 120).unwrap(),
                     mode: ProcessingMode::RemuxCopy,
                     clients: Vec::new(),
                 },
@@ -1126,7 +1126,7 @@ mod tests {
             .start(
                 "feed".into(),
                 pipeline.clone(),
-                SrtListenerConfig::new(9000, 120).unwrap(),
+                SrtListenerConfig::new(10000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
             )
             .unwrap_err();
@@ -1196,7 +1196,7 @@ mod tests {
                 pipeline: gst::Pipeline::new(),
                 state: StreamState::Running,
                 restarts: 0,
-                config: SrtListenerConfig::new(9000, 120).unwrap(),
+                config: SrtListenerConfig::new(10000, 120).unwrap(),
                 mode: ProcessingMode::RemuxCopy,
                 clients: vec![current_client.clone()],
             },
@@ -1238,7 +1238,7 @@ mod tests {
         let result = supervisor.start(
             "feed".into(),
             pipeline.clone(),
-            SrtListenerConfig::new(9000, 120).unwrap(),
+            SrtListenerConfig::new(10000, 120).unwrap(),
             ProcessingMode::RemuxCopy,
         );
         let pipeline_state = pipeline.current_state();
@@ -1273,7 +1273,7 @@ mod tests {
             .start_with(
                 "feed".into(),
                 pipeline.clone(),
-                SrtListenerConfig::new(9000, 120).unwrap(),
+                SrtListenerConfig::new(10000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
                 move || {
                     assert!(stopping_supervisor.inner.lock().unwrap().is_empty());
@@ -1334,7 +1334,7 @@ mod tests {
             .start_with(
                 "feed".into(),
                 pipeline.clone(),
-                SrtListenerConfig::new(9000, 120).unwrap(),
+                SrtListenerConfig::new(10000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
                 move || {
                     let handle = thread::spawn(move || {
@@ -1402,7 +1402,7 @@ mod tests {
             .start_with(
                 "feed".into(),
                 pipeline.clone(),
-                SrtListenerConfig::new(9000, 120).unwrap(),
+                SrtListenerConfig::new(10000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
                 || {},
                 move |_| {
@@ -1468,7 +1468,7 @@ mod tests {
             .start_with(
                 "feed".into(),
                 pipeline.clone(),
-                SrtListenerConfig::new(9000, 120).unwrap(),
+                SrtListenerConfig::new(10000, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
                 move || {
                     stop_supervisor
@@ -1624,7 +1624,7 @@ mod tests {
             .register_start(
                 "feed".into(),
                 competing.clone(),
-                SrtListenerConfig::new(9001, 120).unwrap(),
+                SrtListenerConfig::new(10001, 120).unwrap(),
                 ProcessingMode::RemuxCopy,
             )
             .unwrap_err();
@@ -1648,7 +1648,7 @@ mod tests {
                 pipeline: replacement.clone(),
                 state: StreamState::WaitingForCaller,
                 restarts: 0,
-                config: SrtListenerConfig::new(9001, 120).unwrap(),
+                config: SrtListenerConfig::new(10001, 120).unwrap(),
                 mode: ProcessingMode::RemuxCopy,
                 clients: Vec::new(),
             },
@@ -1888,7 +1888,7 @@ mod tests {
         let event = events.try_recv().unwrap();
         assert_eq!(event.state, StreamState::Starting);
         assert_eq!(event.detail.as_deref(), Some("starting again"));
-        assert_eq!(event.port, Some(9000));
+        assert_eq!(event.port, Some(10000));
         assert_eq!(event.latency_ms, Some(120));
         assert_eq!(event.mode, Some(ProcessingMode::RemuxCopy));
         assert_eq!(event.loop_count, Some(0));

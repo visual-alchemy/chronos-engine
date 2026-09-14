@@ -37,9 +37,10 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 definition_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS streams (
+            DROP TABLE IF EXISTS streams;
+            CREATE TABLE streams (
                 id TEXT PRIMARY KEY,
-                udp_port INTEGER NOT NULL UNIQUE CHECK (udp_port BETWEEN 9000 AND 9099),
+                udp_port INTEGER NOT NULL UNIQUE CHECK (udp_port BETWEEN 10000 AND 10049),
                 config_json TEXT NOT NULL DEFAULT '{}',
                 state TEXT NOT NULL DEFAULT 'draft'
             );
@@ -124,20 +125,20 @@ mod tests {
         let database = Database::open_in_memory().expect("database");
 
         database
-            .allocate_port("stream-a", 9000)
+            .allocate_port("stream-a", 10000)
             .expect("first allocation");
-        assert!(database.allocate_port("stream-b", 9000).is_err());
+        assert!(database.allocate_port("stream-b", 10000).is_err());
     }
 
     #[test]
     fn releases_a_port_for_another_stream() {
         let database = Database::open_in_memory().expect("database");
         database
-            .allocate_port("stream-a", 9000)
+            .allocate_port("stream-a", 10000)
             .expect("allocation");
         database.release_port("stream-a").expect("release");
         database
-            .allocate_port("stream-b", 9000)
+            .allocate_port("stream-b", 10000)
             .expect("reallocation");
     }
 
@@ -145,13 +146,40 @@ mod tests {
     fn releases_non_durable_allocations_on_restart() {
         let database = Database::open_in_memory().expect("database");
         database
-            .allocate_port("stream-a", 9000)
+            .allocate_port("stream-a", 10000)
             .expect("allocation");
         database
             .release_runtime_allocations()
             .expect("release allocations");
         database
-            .allocate_port("stream-b", 9000)
+            .allocate_port("stream-b", 10000)
             .expect("reallocation");
+    }
+
+    #[test]
+    fn migrates_a_stale_port_check_constraint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("chronos.db");
+
+        {
+            let connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(
+                    "CREATE TABLE streams (
+                        id TEXT PRIMARY KEY,
+                        udp_port INTEGER NOT NULL UNIQUE CHECK (udp_port BETWEEN 9000 AND 9099),
+                        config_json TEXT NOT NULL DEFAULT '{}',
+                        state TEXT NOT NULL DEFAULT 'draft'
+                    );",
+                )
+                .expect("create legacy schema");
+        }
+
+        let database = Database::open(&path).expect("reopen");
+
+        database
+            .allocate_port("stream-a", 10000)
+            .expect("in-range port after migration");
+        assert!(database.allocate_port("stream-b", 9000).is_err());
     }
 }

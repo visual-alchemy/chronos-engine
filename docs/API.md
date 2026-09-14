@@ -42,16 +42,16 @@ Returns a typed processing decision after the asset has been probed. `mode` is `
 `POST /api/streams` creates an SRT listener copy stream:
 
 ```json
-{ "id": "morning-feed", "media_id": "...", "port": 9000, "latency_ms": 120 }
+{ "id": "morning-feed", "media_id": "...", "port": 10000, "latency_ms": 120 }
 ```
 
-Ports are constrained to `9000`–`9099` and cannot be allocated twice. `GET /api/streams` returns state:
+Ports are constrained to `10000`–`10049` and cannot be allocated twice. `GET /api/streams` returns state:
 
 ```json
 {
   "stream_id": "morning-feed",
   "state": "running",
-  "port": 9000,
+  "port": 10000,
   "latency_ms": 120,
   "mode": "remux_copy",
   "loop_count": 0,

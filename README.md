@@ -32,13 +32,14 @@ Required plugin sets: **base**, **good**, **bad** (`mpegtsmux`, `srtsink`), **ug
 | `BIND_ADDR` | `0.0.0.0:8080` | HTTP bind address |
 | `RUST_LOG` | `chronos_engine=info,tower_http=info` | Tracing filter |
 | `GST_DEBUG` | — | GStreamer debug level (e.g. `3`) |
+| `LAN_IP` | — | Host's LAN IP shown to other devices; set this when running in Docker |
 
 ### Ports
 
 | Port | Protocol | Purpose |
 |---|---|---|
 | `8080` | TCP | HTTP API + dashboard |
-| `9000–9099` | UDP | SRT listener range (one per stream) |
+| `10000–10049` | UDP | SRT listener range (one per stream) |
 
 ---
 
@@ -51,13 +52,13 @@ Required plugin sets: **base**, **good**, **bad** (`mpegtsmux`, `srtsink`), **ug
 docker compose up --build
 ```
 
-This builds the image, mounts `./media` read-only at `/media`, persists the SQLite DB in the `chronos-data` volume, and publishes ports `8080/tcp` + `9000–9099/udp`.
+This builds the image, mounts `./media` read-only at `/media`, persists the SQLite DB in the `chronos-data` volume, and publishes ports `8080/tcp` + `10000–10049/udp`.
 
 Build and run the image manually:
 
 ```bash
 docker build -t chronos-engine .
-docker run --rm -p 8080:8080/tcp -p 9000-9099:9000-9099/udp \
+docker run --rm -p 8080:8080/tcp -p 10000-10049:10000-10049/udp \
   -v "$PWD/media:/media:ro" -v chronos-data:/data \
   -e MEDIA_ROOT=/media -e DATABASE_PATH=/data/chronos.db \
   chronos-engine

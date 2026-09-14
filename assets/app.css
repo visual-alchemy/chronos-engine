@@ -913,6 +913,12 @@ body {
   gap: 0.5rem;
 }
 
+.lan-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
 .stream-vlc-tip {
   display: flex;
   align-items: center;

@@ -43,7 +43,7 @@
       <div class="diagram-node">
         <span class="node-badge">SERVER</span>
         <span class="node-title">CHRONOS ENGINE</span>
-        <span class="node-sub">SRT Listener · UDP 9000–9099</span>
+        <span class="node-sub">SRT Listener · UDP 10000–10049</span>
       </div>
       <div class="diagram-arrow" aria-hidden="true">
         <span class="protocol-tag">MPEG-TS / SRT · COPY-FIRST</span>
@@ -160,9 +160,9 @@
           <div class="port-config-row">
             <label class="control-group port-group">
               <span class="label-text">Listener Port</span>
-              <input class="port text-input" type="number" min="9000" max="9099" value="9000">
+              <input class="port text-input" type="number" min="10000" max="10049" value="10000">
             </label>
-            <kbd class="port-hint">UDP 9000–9099</kbd>
+            <kbd class="port-hint">UDP 10000–10049</kbd>
           </div>
           <button class="start btn btn-primary" disabled>Start listener</button>
         </div>
@@ -209,7 +209,10 @@
         <div class="url-input-block">
           <div class="url-label-row">
             <span class="url-label">VLC on another device (LAN)</span>
-            <button class="copy-lan btn btn-xs btn-secondary">Copy LAN URL</button>
+            <div class="lan-actions">
+              <button class="detect-lan btn btn-xs btn-secondary">Detect IP</button>
+              <button class="copy-lan btn btn-xs btn-secondary">Copy LAN URL</button>
+            </div>
           </div>
           <div class="lan-inputs">
             <input class="lan-host text-input" placeholder="Mac LAN IP, e.g. 192.168.1.28">

@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/streams/{id}/stop", axum::routing::post(stop_stream))
         .route("/api/events", get(event_socket))
         .route("/metrics", get(metrics))
+        .route("/api/network", get(network))
         .with_state(state)
 }
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -78,6 +79,34 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         gstreamer_initialized: true,
         media_root: state.media_root.display().to_string(),
     })
+}
+#[derive(Serialize)]
+struct NetworkInfo {
+    ip: Option<String>,
+}
+async fn network() -> Json<NetworkInfo> {
+    Json(NetworkInfo {
+        ip: detect_lan_ip(),
+    })
+}
+/// Host's LAN IP for VLC-on-another-device; prefers `LAN_IP` env (Docker can't self-detect the host's IP), else probes the egress interface.
+fn detect_lan_ip() -> Option<String> {
+    if let Ok(ip) = std::env::var("LAN_IP") {
+        let ip = ip.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    egress_ip()
+}
+fn egress_ip() -> Option<String> {
+    use std::net::{IpAddr, UdpSocket};
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
+        _ => None,
+    }
 }
 async fn dashboard() -> Html<&'static str> {
     Html(crate::ui::HTML)

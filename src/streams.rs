@@ -1,7 +1,7 @@
 use std::fmt;
 
-pub const SRT_PORT_MIN: u16 = 9000;
-pub const SRT_PORT_MAX: u16 = 9099;
+pub const SRT_PORT_MIN: u16 = 10000;
+pub const SRT_PORT_MAX: u16 = 10049;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SrtListenerConfig {
@@ -30,7 +30,7 @@ pub enum StreamConfigError {
 impl fmt::Display for StreamConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PortOutOfRange(port) => write!(f, "SRT port {port} is outside 9000-9099"),
+            Self::PortOutOfRange(port) => write!(f, "SRT port {port} is outside 10000-10049"),
             Self::InvalidLatency => write!(f, "SRT latency must be positive"),
         }
     }
@@ -44,12 +44,12 @@ mod tests {
 
     #[test]
     fn rejects_ports_outside_the_reserved_range() {
-        assert!(SrtListenerConfig::new(8999, 120).is_err());
-        assert!(SrtListenerConfig::new(9100, 120).is_err());
+        assert!(SrtListenerConfig::new(9999, 120).is_err());
+        assert!(SrtListenerConfig::new(10050, 120).is_err());
     }
 
     #[test]
     fn rejects_latency_that_gstreamer_cannot_represent() {
-        assert!(SrtListenerConfig::new(9000, i32::MAX as u32 + 1).is_err());
+        assert!(SrtListenerConfig::new(10000, i32::MAX as u32 + 1).is_err());
     }
 }

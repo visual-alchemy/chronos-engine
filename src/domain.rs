@@ -161,7 +161,7 @@ mod tests {
             stream_id: "feed".into(),
             state: StreamState::Running,
             detail: None,
-            port: Some(9000),
+            port: Some(10000),
             latency_ms: Some(120),
             mode: Some(ProcessingMode::RemuxCopy),
             loop_count: Some(0),

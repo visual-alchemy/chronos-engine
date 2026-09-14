@@ -146,6 +146,28 @@ async function copy(text, button) {
   }
 }
 
+let detectedLanIp = '';
+
+async function detectLanIp() {
+  try {
+    const info = await api('/api/network');
+    detectedLanIp = info.ip || '';
+    if (detectedLanIp) {
+      document.querySelectorAll('.lan-host').forEach((input) => {
+        if (!input.value) {
+          input.value = detectedLanIp;
+          input.dispatchEvent(new Event('input'));
+        }
+      });
+      event(`Detected LAN IP: ${detectedLanIp}`);
+    } else {
+      event('Could not auto-detect LAN IP. Enter it manually.', true);
+    }
+  } catch (err) {
+    event(`LAN IP detection failed: ${err.message}`, true);
+  }
+}
+
 async function loadMedia() {
   try {
     const items = await api('/api/media');
@@ -181,7 +203,7 @@ async function loadMedia() {
         probeBadge.textContent = item.probe_status.toUpperCase();
       }
 
-      port.value = 9000 + index;
+      port.value = 10000 + index;
 
       probe.onclick = async () => {
         probe.disabled = true;
@@ -248,8 +270,8 @@ async function loadMedia() {
 
       start.onclick = async () => {
         const selectedPort = Number(port.value);
-        if (selectedPort < 9000 || selectedPort > 9099) {
-          show(result, 'Invalid Port', ['UDP port must be between 9000 and 9099.'], true);
+        if (selectedPort < 10000 || selectedPort > 10049) {
+          show(result, 'Invalid Port', ['UDP port must be between 10000 and 10049.'], true);
           return;
         }
         start.disabled = true;
@@ -347,7 +369,7 @@ async function loadStreams() {
         modeBadge.textContent = `UDP ${stream.port} · ${labels[stream.mode] || 'Pipeline configured'}`;
       }
 
-      host.value = localStorage.getItem('chronos-lan-host') || '';
+      host.value = localStorage.getItem('chronos-lan-host') || detectedLanIp || '';
       host.oninput = () => {
         localStorage.setItem('chronos-lan-host', host.value.trim());
         renderUrls();
@@ -368,6 +390,9 @@ async function loadStreams() {
         }
         copy(lan.value, lanButton);
       };
+
+      const detectButton = card.querySelector('.detect-lan');
+      if (detectButton) detectButton.onclick = () => detectLanIp();
 
       card.querySelector('.stop').onclick = async () => {
         try {
@@ -394,6 +419,7 @@ async function load() {
     healthVal.textContent = h.status.toUpperCase();
     healthVal.classList.remove('error');
     if (healthDot) healthDot.classList.remove('error');
+    await detectLanIp();
     await Promise.all([loadMedia(), loadStreams()]);
   } catch (err) {
     healthVal.textContent = 'OFFLINE';

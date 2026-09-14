@@ -16,7 +16,7 @@ fn listener_uri(srt: SrtListenerConfig) -> String {
 fn configure_listener(sink: &gst::Element, srt: SrtListenerConfig) {
     sink.set_property("uri", listener_uri(srt));
     sink.set_property("authentication", false);
-    sink.set_property("wait-for-connection", true);
+    sink.set_property("wait-for-connection", false);
 }
 
 fn configure_ts_mux(mux: &gst::Element) {
@@ -48,8 +48,20 @@ fn make_rate_limiter() -> Result<gst::Element> {
     Ok(id)
 }
 
+fn make_adts_capsfilter() -> Result<gst::Element> {
+    let filter = make("capsfilter")?;
+    filter.set_property(
+        "caps",
+        gst::Caps::builder("audio/mpeg")
+            .field("mpegversion", 4i32)
+            .field("stream-format", "adts")
+            .build(),
+    );
+    Ok(filter)
+}
+
 #[cfg(test)]
-pub fn copy_graph_elements() -> [&'static str; 8] {
+pub fn copy_graph_elements() -> [&'static str; 9] {
     [
         "filesrc",
         "qtdemux",
@@ -57,6 +69,7 @@ pub fn copy_graph_elements() -> [&'static str; 8] {
         "h264parse",
         "queue",
         "aacparse",
+        "capsfilter",
         "mpegtsmux",
         "srtsink",
     ]
@@ -203,6 +216,7 @@ pub fn build_hybrid_pipeline(
             &mux,
         ])?;
     } else {
+        let audio_caps = make_adts_capsfilter()?;
         pipeline.add_many([
             &source,
             &demux,
@@ -211,6 +225,7 @@ pub fn build_hybrid_pipeline(
             &video_encoder,
             &video_parser,
             &audio_parser,
+            &audio_caps,
             &mux,
             &rate_limiter,
             &sink,
@@ -224,7 +239,7 @@ pub fn build_hybrid_pipeline(
             &rate_limiter,
             &sink,
         ])?;
-        audio_parser.link(&mux)?;
+        gst::Element::link_many([&audio_parser, &audio_caps, &mux])?;
     }
     let video_target = if copy_video {
         video_parser.static_pad("sink")
@@ -296,6 +311,7 @@ pub fn build_h264_aac_copy_pipeline(path: &Path, srt: SrtListenerConfig) -> Resu
     configure_h264_parser(&video_parser);
     let audio_queue = make("queue")?;
     let audio_parser = make("aacparse")?;
+    let audio_caps = make_adts_capsfilter()?;
     let mux = make("mpegtsmux")?;
     configure_ts_mux(&mux);
     let rate_limiter = make_rate_limiter()?;
@@ -308,13 +324,14 @@ pub fn build_h264_aac_copy_pipeline(path: &Path, srt: SrtListenerConfig) -> Resu
         &video_parser,
         &audio_queue,
         &audio_parser,
+        &audio_caps,
         &mux,
         &rate_limiter,
         &sink,
     ])?;
     source.link(&demux)?;
     gst::Element::link_many([&video_queue, &video_parser, &mux, &rate_limiter, &sink])?;
-    gst::Element::link_many([&audio_queue, &audio_parser, &mux])?;
+    gst::Element::link_many([&audio_queue, &audio_parser, &audio_caps, &mux])?;
     let video_sink = video_queue
         .static_pad("sink")
         .context("video queue missing sink pad")?;
@@ -376,6 +393,7 @@ mod tests {
                 "h264parse",
                 "queue",
                 "aacparse",
+                "capsfilter",
                 "mpegtsmux",
                 "srtsink"
             ]
@@ -421,5 +439,61 @@ mod tests {
             .count();
 
         assert_eq!(queue_count, 2, "video and audio each need their own queue");
+    }
+
+    #[test]
+    fn copy_pipeline_forces_adts_audio() {
+        gstreamer::init().expect("GStreamer initializes");
+        let pipeline = build_h264_aac_copy_pipeline(
+            Path::new("/tmp/chronos-test-input.mov"),
+            SrtListenerConfig {
+                port: 9000,
+                latency_ms: 120,
+            },
+        )
+        .expect("copy pipeline builds");
+
+        let capsfilter_count = pipeline
+            .iterate_elements()
+            .into_iter()
+            .map(|element| element.expect("stable pipeline iteration"))
+            .filter(|element| {
+                element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "capsfilter")
+            })
+            .count();
+
+        assert_eq!(capsfilter_count, 1, "copy pipeline must force ADTS audio");
+    }
+
+    #[test]
+    fn copy_pipeline_accepts_callers_without_waiting() {
+        gstreamer::init().expect("GStreamer initializes");
+        let pipeline = build_h264_aac_copy_pipeline(
+            Path::new("/tmp/chronos-test-input.mov"),
+            SrtListenerConfig {
+                port: 9000,
+                latency_ms: 120,
+            },
+        )
+        .expect("copy pipeline builds");
+
+        let waits = pipeline
+            .iterate_elements()
+            .into_iter()
+            .map(|element| element.expect("stable pipeline iteration"))
+            .find(|element| {
+                element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "srtsink")
+            })
+            .expect("srtsink is present")
+            .property::<bool>("wait-for-connection");
+
+        assert!(
+            !waits,
+            "srtsink must stream to callers without blocking for the first one"
+        );
     }
 }

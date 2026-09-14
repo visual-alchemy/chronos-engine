@@ -18,4 +18,4 @@
 - `full_transcode`: decode both tracks and output profile codecs.
 
 ## Safety
-Canonicalize every catalog path and require it to remain under `/media`. Never concatenate user input into a GStreamer launch description. Use port range 9000-9099. Secrets must be masked in API events and logs.
+Canonicalize every catalog path and require it to remain under `/media`. Never concatenate user input into a GStreamer launch description. Use port range 10000-10049. Secrets must be masked in API events and logs.
