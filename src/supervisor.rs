@@ -456,6 +456,16 @@ impl Supervisor {
         Ok(())
     }
     fn record_eos(&self, id: &str, expected_pipeline: &gst::Pipeline) {
+        self.record_eos_with(id, expected_pipeline, |pipeline| {
+            pipeline.set_state(gst::State::Playing)?;
+            Ok(())
+        });
+    }
+
+    fn record_eos_with<F>(&self, id: &str, expected_pipeline: &gst::Pipeline, set_playing: F)
+    where
+        F: FnOnce(&gst::Pipeline) -> Result<()>,
+    {
         // Restart the pipeline from scratch on every EOS so the file loops
         // indefinitely. A seek_simple is unreliable once srtsink holds an
         // open UDP socket: the flush propagates into the sink and can cause
@@ -480,26 +490,86 @@ impl Supervisor {
         if let Err(err) = pipeline.set_state(gst::State::Null) {
             tracing::warn!(stream_id = id, ?err, "EOS: failed to set pipeline to Null");
         }
-        if let Err(err) = pipeline.set_state(gst::State::Playing) {
-            tracing::warn!(stream_id = id, ?err, "EOS: failed to restart pipeline");
-            // Mark failed only when we can't recover
-            if let Ok(mut streams) = self.inner.lock() {
-                if let Some(managed) = streams.get_mut(id)
-                    && managed.pipeline == *expected_pipeline
-                    && managed.state != StreamState::Stopping
-                {
-                    managed.state = StreamState::Failed;
-                }
-            }
-            self.emit_if_current_state(
-                id,
-                expected_pipeline,
-                StreamState::Failed,
-                Some("EOS restart failed".into()),
-            );
+        let still_current = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|streams| {
+                streams.get(id).map(|managed| {
+                    managed.pipeline == *expected_pipeline && managed.state == StreamState::Looping
+                })
+            })
+            .unwrap_or(false);
+        if !still_current {
             return;
         }
-        self.emit_if_current_state(id, expected_pipeline, StreamState::Looping, None);
+
+        if let Err(err) = set_playing(&pipeline) {
+            tracing::warn!(stream_id = id, ?err, "EOS: failed to restart pipeline");
+            {
+                let _publication = self
+                    .publication
+                    .lock()
+                    .expect("supervisor publication mutex poisoned");
+                let event = {
+                    let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+                    streams.get_mut(id).and_then(|managed| {
+                        (managed.pipeline == *expected_pipeline
+                            && managed.state == StreamState::Looping)
+                            .then(|| {
+                                managed.state = StreamState::Failed;
+                                event_from_managed(
+                                    id,
+                                    managed,
+                                    StreamState::Failed,
+                                    Some("EOS restart failed".into()),
+                                )
+                            })
+                    })
+                };
+                if let Some(event) = event {
+                    let _ = self.events.send(event);
+                }
+            }
+            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+                tracing::warn!(
+                    stream_id = id,
+                    ?cleanup_error,
+                    "EOS: failed to stop unsuccessful pipeline"
+                );
+            }
+            return;
+        }
+
+        let restarted = {
+            let _publication = self
+                .publication
+                .lock()
+                .expect("supervisor publication mutex poisoned");
+            let event = {
+                let streams = self.inner.lock().expect("supervisor mutex poisoned");
+                streams.get(id).and_then(|managed| {
+                    (managed.pipeline == *expected_pipeline
+                        && managed.state == StreamState::Looping)
+                        .then(|| event_from_managed(id, managed, StreamState::Looping, None))
+                })
+            };
+            if let Some(event) = event {
+                let _ = self.events.send(event);
+                true
+            } else {
+                false
+            }
+        };
+        if !restarted {
+            if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
+                tracing::warn!(
+                    stream_id = id,
+                    ?cleanup_error,
+                    "EOS: failed to stop stale pipeline"
+                );
+            }
+        }
     }
     fn record_error(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
         if let Ok(mut streams) = self.inner.lock()
@@ -855,6 +925,29 @@ mod tests {
 
         assert!(supervisor.monitor_bus("feed", &original).is_none());
         assert!(supervisor.monitor_bus("feed", &replacement).is_some());
+    }
+
+    #[test]
+    fn stopped_eos_restart_is_nulled_without_looping_event() {
+        gst::init().unwrap();
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut events = supervisor.subscribe();
+        let stopping_supervisor = supervisor.clone();
+
+        supervisor.record_eos_with("feed", &pipeline, move |pipeline| {
+            stopping_supervisor.stop("feed")?;
+            pipeline.set_state(gst::State::Ready)?;
+            Ok(())
+        });
+
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert!(supervisor.states().is_empty());
+        let states: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.state)
+            .collect();
+        assert_eq!(states, vec![StreamState::Stopping, StreamState::Stopped]);
     }
 
     #[test]
