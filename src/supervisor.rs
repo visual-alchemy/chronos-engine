@@ -381,6 +381,16 @@ impl Supervisor {
         }
     }
     pub fn stop(&self, id: &str) -> Result<()> {
+        self.stop_with(id, |pipeline| {
+            pipeline.set_state(gst::State::Null)?;
+            Ok(())
+        })
+    }
+
+    fn stop_with<F>(&self, id: &str, set_null: F) -> Result<()>
+    where
+        F: FnOnce(&gst::Pipeline) -> Result<()>,
+    {
         let pipeline = {
             let _publication = self
                 .publication
@@ -414,57 +424,96 @@ impl Supervisor {
             pipeline
         };
 
-        let stop_result = if let Some(pipeline) = pipeline.as_ref() {
-            pipeline.set_state(gst::State::Null).map(|_| ())
-        } else {
-            Ok(())
-        };
-
-        {
+        let Some(pipeline) = pipeline else {
             let _publication = self
                 .publication
                 .lock()
                 .expect("supervisor publication mutex poisoned");
-            let removed = {
-                let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                pipeline.as_ref().and_then(|pipeline| {
+            let _ = self.events.send(StreamEvent {
+                stream_id: id.into(),
+                state: StreamState::Stopped,
+                detail: None,
+                port: None,
+                latency_ms: None,
+                mode: None,
+                loop_count: None,
+                clients: Vec::new(),
+            });
+            return Ok(());
+        };
+
+        match set_null(&pipeline) {
+            Ok(()) => {
+                let _publication = self
+                    .publication
+                    .lock()
+                    .expect("supervisor publication mutex poisoned");
+                let event = {
+                    let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
                     let is_current = streams
                         .get(id)
-                        .is_some_and(|managed| managed.pipeline == *pipeline);
-                    is_current.then(|| streams.remove(id)).flatten()
-                })
-            };
-            if stop_result.is_ok() {
-                let event = removed
-                    .as_ref()
-                    .map(|managed| event_from_managed(id, managed, StreamState::Stopped, None))
-                    .unwrap_or_else(|| StreamEvent {
-                        stream_id: id.into(),
-                        state: StreamState::Stopped,
-                        detail: None,
-                        port: None,
-                        latency_ms: None,
-                        mode: None,
-                        loop_count: None,
-                        clients: Vec::new(),
-                    });
-                let _ = self.events.send(event);
+                        .is_some_and(|managed| managed.pipeline == pipeline);
+                    is_current
+                        .then(|| streams.remove(id))
+                        .flatten()
+                        .map(|mut managed| {
+                            managed.clients.clear();
+                            event_from_managed(id, &managed, StreamState::Stopped, None)
+                        })
+                };
+                if let Some(event) = event {
+                    let _ = self.events.send(event);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let detail = format!("Failed to stop pipeline: {error}");
+                let _publication = self
+                    .publication
+                    .lock()
+                    .expect("supervisor publication mutex poisoned");
+                let event = {
+                    let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+                    streams.get_mut(id).and_then(|managed| {
+                        (managed.pipeline == pipeline && managed.state == StreamState::Stopping)
+                            .then(|| {
+                                managed.state = StreamState::Failed;
+                                event_from_managed(id, managed, StreamState::Failed, Some(detail))
+                            })
+                    })
+                };
+                tracing::error!(stream_id = id, %error, "Failed to stop GStreamer pipeline");
+                if let Some(event) = event {
+                    let _ = self.events.send(event);
+                }
+                Err(error)
             }
         }
-
-        stop_result?;
-        Ok(())
     }
     fn record_eos(&self, id: &str, expected_pipeline: &gst::Pipeline) {
-        self.record_eos_with(id, expected_pipeline, |pipeline| {
-            pipeline.set_state(gst::State::Playing)?;
-            Ok(())
-        });
+        self.record_eos_with(
+            id,
+            expected_pipeline,
+            |pipeline| {
+                pipeline.set_state(gst::State::Null)?;
+                Ok(())
+            },
+            |pipeline| {
+                pipeline.set_state(gst::State::Playing)?;
+                Ok(())
+            },
+        );
     }
 
-    fn record_eos_with<F>(&self, id: &str, expected_pipeline: &gst::Pipeline, set_playing: F)
-    where
-        F: FnOnce(&gst::Pipeline) -> Result<()>,
+    fn record_eos_with<N, P>(
+        &self,
+        id: &str,
+        expected_pipeline: &gst::Pipeline,
+        set_null: N,
+        set_playing: P,
+    ) where
+        N: FnOnce(&gst::Pipeline) -> Result<()>,
+        P: FnOnce(&gst::Pipeline) -> Result<()>,
     {
         // Restart the pipeline from scratch on every EOS so the file loops
         // indefinitely. A seek_simple is unreliable once srtsink holds an
@@ -487,8 +536,11 @@ impl Supervisor {
             managed.pipeline.clone()
         };
         // Stop and immediately restart to loop the file.
-        if let Err(err) = pipeline.set_state(gst::State::Null) {
-            tracing::warn!(stream_id = id, ?err, "EOS: failed to set pipeline to Null");
+        if let Err(error) = set_null(&pipeline) {
+            let detail = format!("EOS restart failed to stop pipeline: {error}");
+            tracing::error!(stream_id = id, %error, "EOS: failed to set pipeline to Null");
+            self.record_restart_failure(id, expected_pipeline, detail);
+            return;
         }
         let still_current = self
             .inner
@@ -504,33 +556,10 @@ impl Supervisor {
             return;
         }
 
-        if let Err(err) = set_playing(&pipeline) {
-            tracing::warn!(stream_id = id, ?err, "EOS: failed to restart pipeline");
-            {
-                let _publication = self
-                    .publication
-                    .lock()
-                    .expect("supervisor publication mutex poisoned");
-                let event = {
-                    let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
-                    streams.get_mut(id).and_then(|managed| {
-                        (managed.pipeline == *expected_pipeline
-                            && managed.state == StreamState::Looping)
-                            .then(|| {
-                                managed.state = StreamState::Failed;
-                                event_from_managed(
-                                    id,
-                                    managed,
-                                    StreamState::Failed,
-                                    Some("EOS restart failed".into()),
-                                )
-                            })
-                    })
-                };
-                if let Some(event) = event {
-                    let _ = self.events.send(event);
-                }
-            }
+        if let Err(error) = set_playing(&pipeline) {
+            let detail = format!("EOS restart failed to start pipeline: {error}");
+            tracing::error!(stream_id = id, %error, "EOS: failed to restart pipeline");
+            self.record_restart_failure(id, expected_pipeline, detail);
             if let Err(cleanup_error) = pipeline.set_state(gst::State::Null) {
                 tracing::warn!(
                     stream_id = id,
@@ -569,6 +598,26 @@ impl Supervisor {
                     "EOS: failed to stop stale pipeline"
                 );
             }
+        }
+    }
+
+    fn record_restart_failure(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("supervisor publication mutex poisoned");
+        let event = {
+            let mut streams = self.inner.lock().expect("supervisor mutex poisoned");
+            streams.get_mut(id).and_then(|managed| {
+                (managed.pipeline == *expected_pipeline && managed.state == StreamState::Looping)
+                    .then(|| {
+                        managed.state = StreamState::Failed;
+                        event_from_managed(id, managed, StreamState::Failed, Some(detail))
+                    })
+            })
+        };
+        if let Some(event) = event {
+            let _ = self.events.send(event);
         }
     }
     fn record_error(&self, id: &str, expected_pipeline: &gst::Pipeline, detail: String) {
@@ -882,6 +931,59 @@ mod tests {
     }
 
     #[test]
+    fn stopped_event_always_clears_clients() {
+        let supervisor = supervisor_with_test_stream("feed");
+        supervisor.record_client_added(
+            "feed",
+            SrtClientAddress {
+                ip: "192.0.2.10".into(),
+                port: 54321,
+            },
+        );
+        let mut events = supervisor.subscribe();
+
+        supervisor.stop("feed").unwrap();
+
+        let stopping = events.try_recv().unwrap();
+        assert_eq!(stopping.state, StreamState::Stopping);
+        assert_eq!(stopping.clients.len(), 1);
+        let stopped = events.try_recv().unwrap();
+        assert_eq!(stopped.state, StreamState::Stopped);
+        assert!(stopped.clients.is_empty());
+    }
+
+    #[test]
+    fn failed_stop_retains_managed_pipeline_and_reports_failure() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        supervisor.record_client_added(
+            "feed",
+            SrtClientAddress {
+                ip: "192.0.2.10".into(),
+                port: 54321,
+            },
+        );
+        let mut events = supervisor.subscribe();
+
+        let error = supervisor
+            .stop_with("feed", |_| anyhow::bail!("injected Null failure"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected Null failure"));
+        let states = supervisor.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, StreamState::Failed);
+        assert_eq!(states[0].clients.len(), 1);
+        assert_eq!(supervisor.inner.lock().unwrap()["feed"].pipeline, pipeline);
+        let stopping = events.try_recv().unwrap();
+        assert_eq!(stopping.state, StreamState::Stopping);
+        let failed = events.try_recv().unwrap();
+        assert_eq!(failed.state, StreamState::Failed);
+        assert!(failed.detail.unwrap().contains("injected Null failure"));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
     fn competing_start_cannot_replace_managed_pipeline() {
         gst::init().unwrap();
         let supervisor = supervisor_with_test_stream("feed");
@@ -936,11 +1038,19 @@ mod tests {
         let mut events = supervisor.subscribe();
         let stopping_supervisor = supervisor.clone();
 
-        supervisor.record_eos_with("feed", &pipeline, move |pipeline| {
-            stopping_supervisor.stop("feed")?;
-            pipeline.set_state(gst::State::Ready)?;
-            Ok(())
-        });
+        supervisor.record_eos_with(
+            "feed",
+            &pipeline,
+            |pipeline| {
+                pipeline.set_state(gst::State::Null)?;
+                Ok(())
+            },
+            move |pipeline| {
+                stopping_supervisor.stop("feed")?;
+                pipeline.set_state(gst::State::Ready)?;
+                Ok(())
+            },
+        );
 
         assert_eq!(pipeline.current_state(), gst::State::Null);
         assert!(supervisor.states().is_empty());
@@ -948,6 +1058,34 @@ mod tests {
             .map(|event| event.state)
             .collect();
         assert_eq!(states, vec![StreamState::Stopping, StreamState::Stopped]);
+    }
+
+    #[test]
+    fn eos_null_failure_never_attempts_playing_and_reports_failed() {
+        let supervisor = supervisor_with_test_stream("feed");
+        let pipeline = supervisor.inner.lock().unwrap()["feed"].pipeline.clone();
+        let mut events = supervisor.subscribe();
+        let playing_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = playing_calls.clone();
+
+        supervisor.record_eos_with(
+            "feed",
+            &pipeline,
+            |_| anyhow::bail!("injected Null failure"),
+            move |_| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(playing_calls.load(Ordering::SeqCst), 0);
+        let states = supervisor.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, StreamState::Failed);
+        let failed = events.try_recv().unwrap();
+        assert_eq!(failed.state, StreamState::Failed);
+        assert!(failed.detail.unwrap().contains("injected Null failure"));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
