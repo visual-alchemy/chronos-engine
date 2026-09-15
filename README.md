@@ -29,7 +29,7 @@ Required plugin sets: **base**, **good**, **bad** (`mpegtsmux`, `srtsink`), **ug
 |---|---|---|
 | `MEDIA_ROOT` | `/media` | Directory to scan for media assets |
 | `DATABASE_PATH` | `chronos.db` | SQLite file for probe cache + port allocation |
-| `BIND_ADDR` | `0.0.0.0:8080` | HTTP bind address |
+| `BIND_ADDR` | `0.0.0.0:8502` | HTTP bind address |
 | `RUST_LOG` | `chronos_engine=info,tower_http=info` | Tracing filter |
 | `GST_DEBUG` | — | GStreamer debug level (e.g. `3`) |
 | `LAN_IP` | — | Host's LAN IP shown to other devices; set this when running in Docker |
@@ -38,7 +38,7 @@ Required plugin sets: **base**, **good**, **bad** (`mpegtsmux`, `srtsink`), **ug
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| `8080` | TCP | HTTP API + dashboard |
+| `8502` | TCP | HTTP API + dashboard |
 | `10000–10049` | UDP | SRT listener range (one per stream) |
 
 ---
@@ -52,13 +52,13 @@ Required plugin sets: **base**, **good**, **bad** (`mpegtsmux`, `srtsink`), **ug
 docker compose up --build
 ```
 
-This builds the image, mounts `./media` read-only at `/media`, persists the SQLite DB in the `chronos-data` volume, and publishes ports `8080/tcp` + `10000–10049/udp`.
+This builds the image, mounts `./media` read-only at `/media`, persists the SQLite DB in the `chronos-data` volume, and publishes ports `8502/tcp` + `10000–10049/udp`.
 
 Build and run the image manually:
 
 ```bash
 docker build -t chronos-engine .
-docker run --rm -p 8080:8080/tcp -p 10000-10049:10000-10049/udp \
+docker run --rm -p 8502:8502/tcp -p 10000-10049:10000-10049/udp \
   -v "$PWD/media:/media:ro" -v chronos-data:/data \
   -e MEDIA_ROOT=/media -e DATABASE_PATH=/data/chronos.db \
   chronos-engine
@@ -144,17 +144,17 @@ cargo clippy -D warnings   # lints
 
 ## Usage
 
-Open http://localhost:8080/ for the media and stream dashboard. Prometheus-compatible stream metrics are available at http://localhost:8080/metrics.
+Open http://localhost:8502/ for the media and stream dashboard. Prometheus-compatible stream metrics are available at http://localhost:8502/metrics.
 
 ```bash
-curl http://localhost:8080/healthz
-curl http://localhost:8080/api/media
+curl http://localhost:8502/healthz
+curl http://localhost:8502/api/media
 ```
 
 `GET /api/media` returns each asset's opaque `id`. Probe an asset with:
 
 ```bash
-curl http://localhost:8080/api/media/<id>/probe
+curl http://localhost:8502/api/media/<id>/probe
 ```
 
 Probes use the GStreamer Rust bindings and cache results for the running process. See `docs/API.md` for the full response contract.

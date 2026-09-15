@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
     let address: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .unwrap_or_else(|_| "0.0.0.0:8502".into())
         .parse()?;
     tracing::info!(%address, "CHRONOS API started");
     let listener = tokio::net::TcpListener::bind(address).await?;
