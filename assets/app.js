@@ -103,6 +103,15 @@ function getTimestamp() {
   return now.toTimeString().split(' ')[0];
 }
 
+function randomId() {
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
+    const bytes = cryptoObj.getRandomValues(new Uint8Array(4));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Math.random().toString(16).slice(2, 10);
+}
+
 function event(text, isError = false) {
   const list = el('events');
   if (list.firstElementChild && list.firstElementChild.classList.contains('muted')) {
@@ -281,7 +290,7 @@ async function loadMedia() {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
-              id: `stream-${crypto.randomUUID().slice(0, 8)}`,
+              id: `stream-${randomId()}`,
               media_id: item.id,
               port: selectedPort,
               latency_ms: 120,
