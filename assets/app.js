@@ -137,9 +137,34 @@ function event(text, isError = false) {
   }
 }
 
-async function copy(text, button) {
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-9999px';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  const selection = document.getSelection();
+  const savedRange = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
   try {
-    await navigator.clipboard.writeText(text);
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  if (savedRange) {
+    selection.removeAllRanges();
+    selection.addRange(savedRange);
+  }
+  return ok;
+}
+
+async function copy(text, button) {
+  const showCopied = () => {
     const originalText = button.dataset.label || button.textContent;
     button.dataset.label = originalText;
     button.textContent = 'Copied!';
@@ -150,7 +175,22 @@ async function copy(text, button) {
       button.style.borderColor = '';
       button.style.color = '';
     }, 1400);
-  } catch {
+  };
+  let ok = false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+  }
+  if (!ok) {
+    ok = fallbackCopy(text);
+  }
+  if (ok) {
+    showCopied();
+  } else {
     event('Clipboard access unavailable. Select and copy manually.', true);
   }
 }
@@ -333,7 +373,6 @@ async function loadStreams() {
 
     streams.forEach((stream) => {
       const card = el('stream-card').content.firstElementChild.cloneNode(true);
-      const local = card.querySelector('.local-url');
       const host = card.querySelector('.lan-host');
       const lan = card.querySelector('.lan-url');
       const pulseDot = card.querySelector('.stream-pulse-dot');
@@ -342,7 +381,6 @@ async function loadStreams() {
       const clientsLine = card.querySelector('.stream-clients');
 
       const renderUrls = () => {
-        local.value = callerUrl('127.0.0.1', stream);
         lan.value = host.value ? callerUrl(host.value.trim(), stream) : '';
       };
 
@@ -385,12 +423,9 @@ async function loadStreams() {
       };
       renderUrls();
 
-      const localButton = card.querySelector('.copy-local');
       const lanButton = card.querySelector('.copy-lan');
-      localButton.dataset.label = 'Copy local URL';
       lanButton.dataset.label = 'Copy LAN URL';
 
-      localButton.onclick = () => copy(local.value, localButton);
       lanButton.onclick = () => {
         if (!lan.value) {
           event('Please enter your Mac’s LAN IP first (e.g. 192.168.1.28).', true);
